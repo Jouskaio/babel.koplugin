@@ -6,11 +6,15 @@ book, how long and how many pages you read each day. Babel adds them to your own
 (reading time, reading days, streaks). It uses the server address and the login of KOReader's
 "Progress sync" plugin: set that up first (Tools > Progress sync > Custom sync server).
 
+It also brings your books to the e-reader: the ones marked "On my e-reader" in Babel (or the whole
+library) are downloaded into a "Babel" folder, one after the other, when the e-reader goes online.
+
 Menu: Tools > Babel.
 --]]
 
 local DataStorage = require("datastorage")
 local InfoMessage = require("ui/widget/infomessage")
+local lfs = require("libs/libkoreader-lfs")
 local JSON = require("json")
 local LuaSettings = require("luasettings")
 local NetworkMgr = require("ui/network/manager")
@@ -181,6 +185,160 @@ function Babel:upload(verbose)
     end
 end
 
+-- The request function for an address: https needs its own module.
+local function requester(url)
+    return url:match("^https") and require("ssl.https").request or require("socket.http").request
+end
+
+-- The server's answer as a table, or nil and the HTTP code.
+function Babel:getJson(path)
+    local server, user, key = self:login()
+    if not server then
+        return nil, "login"
+    end
+    local sink = {}
+    socketutil:set_timeout(15, 60)
+    local code = socket.skip(1, requester(server)({
+        url = server .. path,
+        method = "GET",
+        headers = { ["Accept"] = "application/vnd.koreader.v1+json", ["x-auth-user"] = user, ["x-auth-key"] = key },
+        sink = ltn12.sink.table(sink),
+    }))
+    socketutil:reset_timeout()
+    if code ~= 200 then
+        return nil, code
+    end
+    local ok, data = pcall(JSON.decode, table.concat(sink))
+    return ok and data or nil, ok and 200 or "json"
+end
+
+-- Where the books go: a "Babel" folder in KOReader's home folder.
+function Babel:downloadDir()
+    local dir = self.settings:readSetting("download_dir")
+    if not dir then
+        local home = G_reader_settings:readSetting("home_dir") or "/sdcard/Books"
+        dir = home .. "/Babel"
+    end
+    return dir
+end
+
+local function safeName(name)
+    return (name:gsub("[/\\:*?\"<>|%c]", "_"))
+end
+
+-- Downloads one book to [path] (through a temporary file, so a failure leaves nothing half-written).
+function Babel:fetchBook(book, path)
+    local server, user, key = self:login()
+    local tmp = path .. ".part"
+    local file = io.open(tmp, "wb")
+    if not file then
+        return false
+    end
+    socketutil:set_timeout(15, 900)
+    local code = socket.skip(1, requester(server)({
+        url = server .. "/library/files/" .. book.sha256,
+        method = "GET",
+        headers = { ["x-auth-user"] = user, ["x-auth-key"] = key },
+        sink = ltn12.sink.file(file),
+    }))
+    socketutil:reset_timeout()
+    if code == 200 and lfs.attributes(tmp, "size") == book.size then
+        os.rename(tmp, path)
+        return true
+    end
+    os.remove(tmp)
+    logger.warn("Babel: could not download", book.name, code)
+    return false
+end
+
+-- Brings the books of the library missing from the e-reader, one per tick so the screen stays alive.
+-- [verbose]: tell the reader how it went (a manual download).
+function Babel:download(verbose)
+    if self.downloading then
+        return
+    end
+    local scope = self.settings:readSetting("download_scope") or "ereader"
+    local data, code = self:getJson("/library?scope=" .. scope)
+    if not data then
+        if verbose then
+            UIManager:show(InfoMessage:new{
+                text = code == "login"
+                    and _("Set up Progress sync first (Tools > Progress sync > Custom sync server), with the address, e-mail and password from Babel.")
+                    or T(_("Could not reach Babel (%1)."), tostring(code)),
+            })
+        end
+        return
+    end
+    local dir = self:downloadDir()
+    lfs.mkdir(dir)
+    local queue = {}
+    for _i, book in ipairs(data.books or {}) do
+        local path = dir .. "/" .. safeName(book.name)
+        if lfs.attributes(path, "size") ~= book.size then
+            queue[#queue + 1] = { book = book, path = path }
+        end
+    end
+    if #queue == 0 then
+        if verbose then
+            UIManager:show(InfoMessage:new{ text = _("Your Babel books are all on the e-reader.") })
+        end
+        return
+    end
+    self.downloading = true
+    local done, failed, index = 0, 0, 0
+    local notice
+    local function step()
+        if notice then
+            UIManager:close(notice)
+        end
+        index = index + 1
+        local job = queue[index]
+        if not job then
+            self.downloading = false
+            local FileManager = require("apps/filemanager/filemanager")
+            if FileManager.instance then
+                FileManager.instance:onRefresh()
+            end
+            UIManager:show(InfoMessage:new{
+                text = failed == 0 and T(_("%1 books downloaded from Babel."), done)
+                    or T(_("%1 books downloaded from Babel, %2 failed."), done, failed),
+                timeout = 5,
+            })
+            return
+        end
+        notice = InfoMessage:new{
+            text = T(_("Downloading from Babel (%1/%2): %3"), index, #queue, job.book.name),
+        }
+        UIManager:show(notice)
+        UIManager:forceRePaint()
+        UIManager:scheduleIn(0.2, function()
+            if self:fetchBook(job.book, job.path) then
+                done = done + 1
+            else
+                failed = failed + 1
+            end
+            step()
+        end)
+    end
+    step()
+end
+
+-- Online again: bring new books, at most once an hour.
+function Babel:onNetworkConnected()
+    if self.settings:readSetting("auto_download") == false then
+        return
+    end
+    local last = self.settings:readSetting("last_download_check")
+    if last and os.time() - last < 3600 then
+        return
+    end
+    self.settings:saveSetting("last_download_check", os.time())
+    self.settings:flush()
+    UIManager:scheduleIn(5, function()
+        self:download(false)
+    end)
+end
+
 function Babel:onCloseDocument()
     if self.settings:readSetting("auto_upload") == false then
         return
@@ -216,6 +374,45 @@ function Babel:addToMainMenu(menu_items)
                     local on = self.settings:readSetting("auto_upload") ~= false
                     self.settings:saveSetting("auto_upload", not on)
                     self.settings:flush()
+                end,
+            },
+            {
+                text = _("Download my Babel books now"),
+                callback = function()
+                    NetworkMgr:runWhenOnline(function()
+                        self:download(true)
+                    end)
+                end,
+            },
+            {
+                text = _("Download new books when online"),
+                checked_func = function()
+                    return self.settings:readSetting("auto_download") ~= false
+                end,
+                callback = function()
+                    local on = self.settings:readSetting("auto_download") ~= false
+                    self.settings:saveSetting("auto_download", not on)
+                    self.settings:flush()
+                end,
+            },
+            {
+                text = _("Download the whole library (not only the books marked \"On my e-reader\")"),
+                checked_func = function()
+                    return self.settings:readSetting("download_scope") == "all"
+                end,
+                callback = function()
+                    local all = self.settings:readSetting("download_scope") == "all"
+                    self.settings:saveSetting("download_scope", all and "ereader" or "all")
+                    self.settings:flush()
+                end,
+            },
+            {
+                text_func = function()
+                    return T(_("Download folder: %1"), self:downloadDir())
+                end,
+                keep_menu_open = true,
+                callback = function()
+                    UIManager:show(InfoMessage:new{ text = self:downloadDir() })
                 end,
             },
             {

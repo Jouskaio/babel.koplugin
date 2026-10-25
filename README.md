@@ -27,4 +27,17 @@ up to date.
   on (it sends only when the e-reader is already online).
 - Babel's Account page shows when statistics last came and for how many books.
 
+## Books on the e-reader
+
+The plugin also brings your Babel books to the e-reader, into a `Babel` folder (in KOReader's home
+folder), named `Author - Title.epub`:
+
+- Mark a book "On my e-reader" in Babel (its sheet in the library), or choose *Download the whole
+  library* in Tools › Babel.
+- Tools › Babel › *Download my Babel books now*, or leave *Download new books when online* on: when
+  the e-reader goes online it checks, at most once an hour, and downloads what is missing, one book
+  after the other.
+- A book downloaded this way is the very file of your library, so its reading progress syncs with
+  Babel without any link to make.
+
 The data stays between your e-reader and your Babel server.

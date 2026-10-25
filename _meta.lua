@@ -2,6 +2,6 @@ local _ = require("gettext")
 return {
     name = "babel",
     fullname = _("Babel"),
-    version = "1.1.0",
-    description = _([[Sends your reading statistics (time and pages read each day) to your Babel server. It uses the server and the login of "Progress sync".]]),
+    version = "1.2.0",
+    description = _([[Sends your reading statistics to your Babel server and downloads your Babel books onto the e-reader. It uses the server and the login of "Progress sync".]]),
 }
