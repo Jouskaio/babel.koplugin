@@ -40,6 +40,16 @@ folder), named `Author - Title.epub`:
 - A book downloaded this way is the very file of your library, so its reading progress syncs with
   Babel without any link to make.
 
+## Books to Babel, and shortcuts
+
+- *Send the e-reader's books to Babel* scans KOReader's home folder (except the Babel folder) for
+  EPUB, PDF and comics Babel does not have, and sends them. They are ticked "On my e-reader" in
+  Babel, like any book the e-reader reports for the first time (progress, statistics, WebDAV).
+- Three actions can be put anywhere KOReader takes actions (a gesture, a profile, the Bookshelf
+  start menu through *System action…*): *Babel: send reading statistics*, *Babel: download my
+  books*, *Babel: send the e-reader's books*.
+- Everything the plugin does shows the e-reader as connected in Babel's Account page.
+
 ## Finished books, highlights, clean-up
 
 - When you close a book you marked as finished, Babel marks it finished too (and it leaves the

@@ -13,6 +13,7 @@ Menu: Tools > Babel.
 --]]
 
 local DataStorage = require("datastorage")
+local Dispatcher = require("dispatcher")
 local InfoMessage = require("ui/widget/infomessage")
 local lfs = require("libs/libkoreader-lfs")
 local JSON = require("json")
@@ -30,6 +31,12 @@ local T = require("ffi/util").template
 
 local DAY = 24 * 60 * 60
 
+-- What this e-reader is called in Babel: anything the plugin does shows it as connected.
+local function deviceName()
+    local ok, device = pcall(require, "device")
+    return ok and device.model or "e-reader"
+end
+
 local Babel = WidgetContainer:extend{
     name = "babel",
     is_doc_only = false,
@@ -37,7 +44,46 @@ local Babel = WidgetContainer:extend{
 
 function Babel:init()
     self.settings = LuaSettings:open(DataStorage:getSettingsDir() .. "/babel.lua")
+    self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
+end
+
+-- One-tap actions: they can be put in a gesture, a profile or the Bookshelf start menu
+-- ("System action...").
+function Babel:onDispatcherRegisterActions()
+    Dispatcher:registerAction("babel_send_stats", {
+        category = "none", event = "BabelSendStats", general = true,
+        title = _("Babel: send reading statistics"),
+    })
+    Dispatcher:registerAction("babel_download", {
+        category = "none", event = "BabelDownload", general = true,
+        title = _("Babel: download my books"),
+    })
+    Dispatcher:registerAction("babel_send_books", {
+        category = "none", event = "BabelSendBooks", general = true,
+        title = _("Babel: send the e-reader's books"),
+    })
+end
+
+function Babel:onBabelSendStats()
+    NetworkMgr:runWhenOnline(function()
+        self:upload(true)
+    end)
+    return true
+end
+
+function Babel:onBabelDownload()
+    NetworkMgr:runWhenOnline(function()
+        self:download(true)
+    end)
+    return true
+end
+
+function Babel:onBabelSendBooks()
+    NetworkMgr:runWhenOnline(function()
+        self:sendBooks(true)
+    end)
+    return true
 end
 
 -- The server and the login of the Progress sync plugin.
@@ -153,7 +199,7 @@ function Babel:upload(verbose)
         say(_("No reading statistics yet. Read a book for a while, then try again."))
         return
     end
-    local body = JSON.encode({ books = books, days = days })
+    local body = JSON.encode({ books = books, days = days, device = deviceName() })
     local url = server .. "/syncs/stats"
     local request = url:match("^https") and require("ssl.https").request
         or require("socket.http").request
@@ -196,6 +242,7 @@ function Babel:getJson(path)
     if not server then
         return nil, "login"
     end
+    path = path .. (path:find("?", 1, true) and "&" or "?") .. "device=" .. require("socket.url").escape(deviceName())
     local sink = {}
     socketutil:set_timeout(15, 60)
     local code = socket.skip(1, requester(server)({
@@ -236,7 +283,7 @@ function Babel:fetchBook(book, path)
     end
     socketutil:set_timeout(15, 900)
     local code = socket.skip(1, requester(server)({
-        url = server .. "/library/files/" .. book.sha256,
+        url = server .. "/library/files/" .. book.sha256 .. "?device=" .. require("socket.url").escape(deviceName()),
         method = "GET",
         headers = { ["x-auth-user"] = user, ["x-auth-key"] = key },
         sink = ltn12.sink.file(file),
@@ -446,6 +493,151 @@ function Babel:syncBook(book)
     end
 end
 
+-- Books on the e-reader (in KOReader's home folder, except the Babel folder) that Babel lacks.
+local BOOK_EXTENSIONS = { epub = true, pdf = true, cbz = true, cbr = true }
+local MAX_BOOK_BYTES = 300 * 1024 * 1024
+
+function Babel:findBooks(dir, found, skip)
+    for name in lfs.dir(dir) do
+        if name ~= "." and name ~= ".." and not name:match("%.sdr$") then
+            local path = dir .. "/" .. name
+            local attr = lfs.attributes(path)
+            if attr and attr.mode == "directory" and path ~= skip then
+                self:findBooks(path, found, skip)
+            elseif attr and attr.mode == "file" then
+                local ext = name:match("%.(%w+)$")
+                if ext and BOOK_EXTENSIONS[ext:lower()] and attr.size > 0 and attr.size <= MAX_BOOK_BYTES then
+                    found[#found + 1] = { path = path, name = name, size = attr.size }
+                end
+            end
+        end
+    end
+    return found
+end
+
+-- Sends Babel the e-reader's books it does not have; Babel marks them "On my e-reader".
+-- One book per tick so the screen stays alive.
+function Babel:sendBooks(verbose)
+    if self.sending then
+        return
+    end
+    local server, user, key = self:login()
+    if not server then
+        if verbose then
+            UIManager:show(InfoMessage:new{
+                text = _("Set up Progress sync first (Tools > Progress sync > Custom sync server), with the address, e-mail and password from Babel."),
+            })
+        end
+        return
+    end
+    local home = G_reader_settings:readSetting("home_dir") or "/sdcard/Books"
+    local books = {}
+    pcall(function()
+        self:findBooks(home, books, self:downloadDir())
+    end)
+    local util = require("util")
+    local byDocument, documents = {}, {}
+    for _i, book in ipairs(books) do
+        local ok, md5 = pcall(util.partialMD5, book.path)
+        if ok and md5 then
+            byDocument[md5] = book
+            documents[#documents + 1] = md5
+        end
+    end
+    local queue = {}
+    for first = 1, #documents, 200 do
+        local batch = {}
+        for i = first, math.min(first + 199, #documents) do
+            batch[#batch + 1] = documents[i]
+        end
+        local payload = JSON.encode({ documents = batch, device = deviceName() })
+        local sink = {}
+        socketutil:set_timeout(15, 60)
+        local code = socket.skip(1, requester(server)({
+            url = server .. "/library/missing",
+            method = "POST",
+            headers = {
+                ["Content-Type"] = "application/json",
+                ["Content-Length"] = tostring(#payload),
+                ["x-auth-user"] = user,
+                ["x-auth-key"] = key,
+            },
+            source = ltn12.source.string(payload),
+            sink = ltn12.sink.table(sink),
+        }))
+        socketutil:reset_timeout()
+        if code ~= 200 then
+            if verbose then
+                UIManager:show(InfoMessage:new{ text = T(_("Could not reach Babel (%1)."), tostring(code)) })
+            end
+            return
+        end
+        local ok, data = pcall(JSON.decode, table.concat(sink))
+        for _i, md5 in ipairs(ok and data and data.missing or {}) do
+            if byDocument[md5] then
+                queue[#queue + 1] = byDocument[md5]
+            end
+        end
+    end
+    if #queue == 0 then
+        if verbose then
+            UIManager:show(InfoMessage:new{ text = _("Babel already has all the books of this e-reader.") })
+        end
+        return
+    end
+    self.sending = true
+    local done, failed, index = 0, 0, 0
+    local notice
+    local function step()
+        if notice then
+            UIManager:close(notice)
+        end
+        index = index + 1
+        local job = queue[index]
+        if not job then
+            self.sending = false
+            UIManager:show(InfoMessage:new{
+                text = failed == 0 and T(_("%1 books sent to Babel."), done)
+                    or T(_("%1 books sent to Babel, %2 failed."), done, failed),
+                timeout = 5,
+            })
+            return
+        end
+        notice = InfoMessage:new{ text = T(_("Sending to Babel (%1/%2): %3"), index, #queue, job.name) }
+        UIManager:show(notice)
+        UIManager:forceRePaint()
+        UIManager:scheduleIn(0.2, function()
+            local file = io.open(job.path, "rb")
+            local code
+            if file then
+                socketutil:set_timeout(15, 900)
+                code = socket.skip(1, requester(server)({
+                    url = server .. "/library/upload?name=" .. require("socket.url").escape(job.name)
+                        .. "&device=" .. require("socket.url").escape(deviceName()),
+                    method = "PUT",
+                    headers = {
+                        ["Content-Type"] = "application/octet-stream",
+                        ["Content-Length"] = tostring(job.size),
+                        ["x-auth-user"] = user,
+                        ["x-auth-key"] = key,
+                    },
+                    source = ltn12.source.file(file),
+                    sink = ltn12.sink.null(),
+                }))
+                socketutil:reset_timeout()
+            end
+            if code == 200 then
+                done = done + 1
+            else
+                failed = failed + 1
+                logger.warn("Babel: could not send", job.name, code)
+            end
+            step()
+        end)
+    end
+    step()
+end
+
 -- Online again: bring new books, at most once an hour.
 function Babel:onNetworkConnected()
     if self.settings:readSetting("auto_download") == false then
@@ -512,6 +704,14 @@ function Babel:addToMainMenu(menu_items)
                 callback = function()
                     NetworkMgr:runWhenOnline(function()
                         self:download(true)
+                    end)
+                end,
+            },
+            {
+                text = _("Send the e-reader's books to Babel"),
+                callback = function()
+                    NetworkMgr:runWhenOnline(function()
+                        self:sendBooks(true)
                     end)
                 end,
             },
