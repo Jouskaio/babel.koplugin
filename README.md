@@ -40,6 +40,15 @@ folder), named `Author - Title.epub`:
 - A book downloaded this way is the very file of your library, so its reading progress syncs with
   Babel without any link to make.
 
+## One button
+
+Tools › Babel › **Sync with Babel** does it all, in this order: sends the reading statistics, sends
+the e-reader's books Babel lacks, downloads the books marked "On my e-reader" (a book already on
+the e-reader, in any folder, is not downloaded again), then tidies the Babel folder: a copy of a
+book that is also elsewhere on the e-reader is removed (the original stays), and finished books
+too when *Remove finished books* is on. One message tells what happened. It also runs by itself
+when the e-reader goes online (at most once an hour); the other entries are under *Options*.
+
 ## Books to Babel, and shortcuts
 
 - *Send the e-reader's books to Babel* scans KOReader's home folder (except the Babel folder) for

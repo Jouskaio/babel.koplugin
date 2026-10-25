@@ -51,6 +51,10 @@ end
 -- One-tap actions: they can be put in a gesture, a profile or the Bookshelf start menu
 -- ("System action...").
 function Babel:onDispatcherRegisterActions()
+    Dispatcher:registerAction("babel_sync", {
+        category = "none", event = "BabelSync", general = true,
+        title = _("Babel: sync"),
+    })
     Dispatcher:registerAction("babel_send_stats", {
         category = "none", event = "BabelSendStats", general = true,
         title = _("Babel: send reading statistics"),
@@ -63,6 +67,13 @@ function Babel:onDispatcherRegisterActions()
         category = "none", event = "BabelSendBooks", general = true,
         title = _("Babel: send the e-reader's books"),
     })
+end
+
+function Babel:onBabelSync()
+    NetworkMgr:runWhenOnline(function()
+        self:syncAll(true)
+    end)
+    return true
 end
 
 function Babel:onBabelSendStats()
@@ -223,6 +234,7 @@ function Babel:upload(verbose)
         self.settings:saveSetting("last_upload", os.time())
         self.settings:flush()
         say(T(_("Sent to Babel: %1 books, %2 days of reading."), #books, #days))
+        return true, #books, #days
     elseif code == 401 then
         say(_("Babel refused the login. Check the e-mail and the KOReader password in Progress sync."))
     else
@@ -332,9 +344,14 @@ end
 
 -- Brings the books of the library missing from the e-reader, one per tick so the screen stays alive.
 -- [verbose]: tell the reader how it went (a manual download).
-function Babel:download(verbose)
+function Babel:download(verbose, finished)
+    local function stop(done, failed)
+        if finished then
+            finished(done or 0, failed or 0)
+        end
+    end
     if self.downloading then
-        return
+        return stop(done, failed)
     end
     local scope = self.settings:readSetting("download_scope") or "ereader"
     local data, code = self:getJson("/library?scope=" .. scope)
@@ -346,15 +363,18 @@ function Babel:download(verbose)
                     or T(_("Could not reach Babel (%1)."), tostring(code)),
             })
         end
-        return
+        return stop(done, failed)
     end
     local dir = self:downloadDir()
     lfs.mkdir(dir)
     self:cleanUp(data.books or {}, verbose)
     local queue = {}
+    -- A book already on the e-reader, wherever it is, is not downloaded a second time.
+    local here = self:localIndex()
     for _i, book in ipairs(data.books or {}) do
         local path = dir .. "/" .. safeName(book.name)
-        if lfs.attributes(path, "size") ~= book.size then
+        local present = (book.md5 and book.md5 ~= "" and here[book.md5]) or lfs.attributes(path, "size") == book.size
+        if not present then
             queue[#queue + 1] = { book = book, path = path }
         end
     end
@@ -362,7 +382,7 @@ function Babel:download(verbose)
         if verbose then
             UIManager:show(InfoMessage:new{ text = _("Your Babel books are all on the e-reader.") })
         end
-        return
+        return stop(done, failed)
     end
     self.downloading = true
     local done, failed, index = 0, 0, 0
@@ -379,12 +399,14 @@ function Babel:download(verbose)
             if FileManager.instance then
                 FileManager.instance:onRefresh()
             end
-            UIManager:show(InfoMessage:new{
-                text = failed == 0 and T(_("%1 books downloaded from Babel."), done)
-                    or T(_("%1 books downloaded from Babel, %2 failed."), done, failed),
-                timeout = 5,
-            })
-            return
+            if not finished then
+                UIManager:show(InfoMessage:new{
+                    text = failed == 0 and T(_("%1 books downloaded from Babel."), done)
+                        or T(_("%1 books downloaded from Babel, %2 failed."), done, failed),
+                    timeout = 5,
+                })
+            end
+            return stop(done, failed)
         end
         notice = InfoMessage:new{
             text = T(_("Downloading from Babel (%1/%2): %3"), index, #queue, job.book.name),
@@ -517,9 +539,14 @@ end
 
 -- Sends Babel the e-reader's books it does not have; Babel marks them "On my e-reader".
 -- One book per tick so the screen stays alive.
-function Babel:sendBooks(verbose)
+function Babel:sendBooks(verbose, finished)
+    local function stop(done, failed)
+        if finished then
+            finished(done or 0, failed or 0)
+        end
+    end
     if self.sending then
-        return
+        return stop(done, failed)
     end
     local server, user, key = self:login()
     if not server then
@@ -528,7 +555,7 @@ function Babel:sendBooks(verbose)
                 text = _("Set up Progress sync first (Tools > Progress sync > Custom sync server), with the address, e-mail and password from Babel."),
             })
         end
-        return
+        return stop(done, failed)
     end
     local home = G_reader_settings:readSetting("home_dir") or "/sdcard/Books"
     local books = {}
@@ -570,7 +597,7 @@ function Babel:sendBooks(verbose)
             if verbose then
                 UIManager:show(InfoMessage:new{ text = T(_("Could not reach Babel (%1)."), tostring(code)) })
             end
-            return
+            return stop(done, failed)
         end
         local ok, data = pcall(JSON.decode, table.concat(sink))
         for _i, md5 in ipairs(ok and data and data.missing or {}) do
@@ -583,7 +610,7 @@ function Babel:sendBooks(verbose)
         if verbose then
             UIManager:show(InfoMessage:new{ text = _("Babel already has all the books of this e-reader.") })
         end
-        return
+        return stop(done, failed)
     end
     self.sending = true
     local done, failed, index = 0, 0, 0
@@ -596,12 +623,14 @@ function Babel:sendBooks(verbose)
         local job = queue[index]
         if not job then
             self.sending = false
-            UIManager:show(InfoMessage:new{
-                text = failed == 0 and T(_("%1 books sent to Babel."), done)
-                    or T(_("%1 books sent to Babel, %2 failed."), done, failed),
-                timeout = 5,
-            })
-            return
+            if not finished then
+                UIManager:show(InfoMessage:new{
+                    text = failed == 0 and T(_("%1 books sent to Babel."), done)
+                        or T(_("%1 books sent to Babel, %2 failed."), done, failed),
+                    timeout = 5,
+                })
+            end
+            return stop(done, failed)
         end
         notice = InfoMessage:new{ text = T(_("Sending to Babel (%1/%2): %3"), index, #queue, job.name) }
         UIManager:show(notice)
@@ -638,7 +667,116 @@ function Babel:sendBooks(verbose)
     step()
 end
 
--- Online again: bring new books, at most once an hour.
+-- Every book of the e-reader by KOReader's identifier (partial md5): identifier -> list of paths.
+function Babel:localIndex()
+    local home = G_reader_settings:readSetting("home_dir") or "/sdcard/Books"
+    local books = {}
+    pcall(function()
+        self:findBooks(home, books, nil)
+    end)
+    local util = require("util")
+    local index = {}
+    for _i, book in ipairs(books) do
+        local ok, md5 = pcall(util.partialMD5, book.path)
+        if ok and md5 then
+            index[md5] = index[md5] or {}
+            index[md5][#index[md5] + 1] = book.path
+        end
+    end
+    return index
+end
+
+-- Removes from the Babel folder the copies of books that are also elsewhere on the e-reader
+-- (the original is kept). Returns how many were removed.
+function Babel:cleanDuplicates()
+    local dir = self:downloadDir()
+    local prefix = dir .. "/"
+    local removed = 0
+    local mine = self.settings:readSetting("downloaded") or {}
+    for _md5, paths in pairs(self:localIndex()) do
+        local inside, outside = {}, 0
+        for _i, path in ipairs(paths) do
+            if path:sub(1, #prefix) == prefix then
+                inside[#inside + 1] = path
+            else
+                outside = outside + 1
+            end
+        end
+        -- Kept: one copy somewhere. If the original is outside the Babel folder, every copy inside
+        -- goes; if all copies are inside, only the extra ones go.
+        local first = outside > 0 and 1 or 2
+        for i = first, #inside do
+            if os.remove(inside[i]) then
+                removed = removed + 1
+                for sha, path in pairs(mine) do
+                    if path == inside[i] then
+                        mine[sha] = nil
+                    end
+                end
+            end
+        end
+    end
+    self.settings:saveSetting("downloaded", mine)
+    self.settings:flush()
+    return removed
+end
+
+-- One button for everything: sends the reading statistics, sends the e-reader's books Babel lacks,
+-- brings the books marked "On my e-reader" (leaving the ones already there), tidies the Babel
+-- folder (copies of books that are elsewhere on the e-reader, finished books if asked), and says
+-- in one message what happened.
+function Babel:syncAll(verbose)
+    if self.syncing then
+        return
+    end
+    if not self:login() then
+        if verbose then
+            UIManager:show(InfoMessage:new{
+                text = _("Set up Progress sync first (Tools > Progress sync > Custom sync server), with the address, e-mail and password from Babel."),
+            })
+        end
+        return
+    end
+    self.syncing = true
+    local report = {}
+    local function finish()
+        self.syncing = false
+        local FileManager = require("apps/filemanager/filemanager")
+        if FileManager.instance then
+            FileManager.instance:onRefresh()
+        end
+        if verbose then
+            UIManager:show(InfoMessage:new{
+                text = table.concat(report, "\n"),
+                timeout = 8,
+            })
+        end
+    end
+    local ok, books, days = self:upload(false)
+    if ok then
+        report[#report + 1] = T(_("Statistics sent: %1 books, %2 days."), books, days)
+    end
+    self:sendBooks(false, function(sent, sendFailed)
+        if sent > 0 or sendFailed > 0 then
+            report[#report + 1] = T(_("Books sent to Babel: %1 (%2 failed)."), sent, sendFailed)
+        end
+        self:download(false, function(got, getFailed)
+            if got > 0 or getFailed > 0 then
+                report[#report + 1] = T(_("Books downloaded: %1 (%2 failed)."), got, getFailed)
+            end
+            local removed = self:cleanDuplicates()
+            if removed > 0 then
+                report[#report + 1] = T(_("Duplicate copies removed: %1."), removed)
+            end
+            if #report == 0 then
+                report[1] = _("Everything is already in sync with Babel.")
+            end
+            finish()
+        end)
+    end)
+end
+
+-- Online again: sync with Babel, at most once an hour.
 function Babel:onNetworkConnected()
     if self.settings:readSetting("auto_download") == false then
         return
@@ -650,7 +788,7 @@ function Babel:onNetworkConnected()
     self.settings:saveSetting("last_download_check", os.time())
     self.settings:flush()
     UIManager:scheduleIn(5, function()
-        self:download(false)
+        self:syncAll(false)
     end)
 end
 
@@ -681,121 +819,135 @@ function Babel:addToMainMenu(menu_items)
         sorting_hint = "tools",
         sub_item_table = {
             {
-                text = _("Send reading statistics now"),
+                text = _("Sync with Babel"),
                 callback = function()
                     NetworkMgr:runWhenOnline(function()
-                        self:upload(true)
+                        self:syncAll(true)
                     end)
                 end,
             },
             {
-                text = _("Send automatically when closing a book"),
-                checked_func = function()
-                    return self.settings:readSetting("auto_upload") ~= false
-                end,
-                callback = function()
-                    local on = self.settings:readSetting("auto_upload") ~= false
-                    self.settings:saveSetting("auto_upload", not on)
-                    self.settings:flush()
-                end,
-            },
-            {
-                text = _("Download my Babel books now"),
-                callback = function()
-                    NetworkMgr:runWhenOnline(function()
-                        self:download(true)
-                    end)
-                end,
-            },
-            {
-                text = _("Send the e-reader's books to Babel"),
-                callback = function()
-                    NetworkMgr:runWhenOnline(function()
-                        self:sendBooks(true)
-                    end)
-                end,
-            },
-            {
-                text = _("Download new books when online"),
-                checked_func = function()
-                    return self.settings:readSetting("auto_download") ~= false
-                end,
-                callback = function()
-                    local on = self.settings:readSetting("auto_download") ~= false
-                    self.settings:saveSetting("auto_download", not on)
-                    self.settings:flush()
-                end,
-            },
-            {
-                text = _("Download the whole library (not only the books marked \"On my e-reader\")"),
-                checked_func = function()
-                    return self.settings:readSetting("download_scope") == "all"
-                end,
-                callback = function()
-                    local all = self.settings:readSetting("download_scope") == "all"
-                    self.settings:saveSetting("download_scope", all and "ereader" or "all")
-                    self.settings:flush()
-                end,
-            },
-            {
-                text_func = function()
-                    return T(_("Download folder: %1"), self:downloadDir())
-                end,
-                keep_menu_open = true,
-                callback = function()
-                    UIManager:show(InfoMessage:new{ text = self:downloadDir() })
-                end,
-            },
-            {
-                text = _("Remove finished books from the Babel folder"),
-                checked_func = function()
-                    return self.settings:readSetting("cleanup") == true
-                end,
-                callback = function()
-                    local on = self.settings:readSetting("cleanup") == true
-                    self.settings:saveSetting("cleanup", not on)
-                    self.settings:flush()
-                end,
-            },
-            {
-                text = _("Tell Babel when I finish a book"),
-                checked_func = function()
-                    return self.settings:readSetting("sync_finished") ~= false
-                end,
-                callback = function()
-                    local on = self.settings:readSetting("sync_finished") ~= false
-                    self.settings:saveSetting("sync_finished", not on)
-                    self.settings:flush()
-                end,
-            },
-            {
-                text = _("Send my highlights and notes to Babel"),
-                checked_func = function()
-                    return self.settings:readSetting("sync_notes") ~= false
-                end,
-                callback = function()
-                    local on = self.settings:readSetting("sync_notes") ~= false
-                    self.settings:saveSetting("sync_notes", not on)
-                    self.settings:flush()
-                end,
-            },
-            {
-                text = _("Test the connection to Babel"),
-                callback = function()
-                    NetworkMgr:runWhenOnline(function()
-                        self:testConnection()
-                    end)
-                end,
-            },
-            {
-                text = _("Send everything again"),
-                callback = function()
-                    self.settings:delSetting("last_upload")
-                    self.settings:flush()
-                    NetworkMgr:runWhenOnline(function()
-                        self:upload(true)
-                    end)
-                end,
+                text = _("Options"),
+                separator = true,
+                sub_item_table = {
+                    {
+                        text = _("Send reading statistics now"),
+                        callback = function()
+                            NetworkMgr:runWhenOnline(function()
+                                self:upload(true)
+                            end)
+                        end,
+                    },
+                    {
+                        text = _("Send automatically when closing a book"),
+                        checked_func = function()
+                            return self.settings:readSetting("auto_upload") ~= false
+                        end,
+                        callback = function()
+                            local on = self.settings:readSetting("auto_upload") ~= false
+                            self.settings:saveSetting("auto_upload", not on)
+                            self.settings:flush()
+                        end,
+                    },
+                    {
+                        text = _("Download my Babel books now"),
+                        callback = function()
+                            NetworkMgr:runWhenOnline(function()
+                                self:download(true)
+                            end)
+                        end,
+                    },
+                    {
+                        text = _("Send the e-reader's books to Babel"),
+                        callback = function()
+                            NetworkMgr:runWhenOnline(function()
+                                self:sendBooks(true)
+                            end)
+                        end,
+                    },
+                    {
+                        text = _("Download new books when online"),
+                        checked_func = function()
+                            return self.settings:readSetting("auto_download") ~= false
+                        end,
+                        callback = function()
+                            local on = self.settings:readSetting("auto_download") ~= false
+                            self.settings:saveSetting("auto_download", not on)
+                            self.settings:flush()
+                        end,
+                    },
+                    {
+                        text = _("Download the whole library (not only the books marked \"On my e-reader\")"),
+                        checked_func = function()
+                            return self.settings:readSetting("download_scope") == "all"
+                        end,
+                        callback = function()
+                            local all = self.settings:readSetting("download_scope") == "all"
+                            self.settings:saveSetting("download_scope", all and "ereader" or "all")
+                            self.settings:flush()
+                        end,
+                    },
+                    {
+                        text_func = function()
+                            return T(_("Download folder: %1"), self:downloadDir())
+                        end,
+                        keep_menu_open = true,
+                        callback = function()
+                            UIManager:show(InfoMessage:new{ text = self:downloadDir() })
+                        end,
+                    },
+                    {
+                        text = _("Remove finished books from the Babel folder"),
+                        checked_func = function()
+                            return self.settings:readSetting("cleanup") == true
+                        end,
+                        callback = function()
+                            local on = self.settings:readSetting("cleanup") == true
+                            self.settings:saveSetting("cleanup", not on)
+                            self.settings:flush()
+                        end,
+                    },
+                    {
+                        text = _("Tell Babel when I finish a book"),
+                        checked_func = function()
+                            return self.settings:readSetting("sync_finished") ~= false
+                        end,
+                        callback = function()
+                            local on = self.settings:readSetting("sync_finished") ~= false
+                            self.settings:saveSetting("sync_finished", not on)
+                            self.settings:flush()
+                        end,
+                    },
+                    {
+                        text = _("Send my highlights and notes to Babel"),
+                        checked_func = function()
+                            return self.settings:readSetting("sync_notes") ~= false
+                        end,
+                        callback = function()
+                            local on = self.settings:readSetting("sync_notes") ~= false
+                            self.settings:saveSetting("sync_notes", not on)
+                            self.settings:flush()
+                        end,
+                    },
+                    {
+                        text = _("Test the connection to Babel"),
+                        callback = function()
+                            NetworkMgr:runWhenOnline(function()
+                                self:testConnection()
+                            end)
+                        end,
+                    },
+                    {
+                        text = _("Send everything again"),
+                        callback = function()
+                            self.settings:delSetting("last_upload")
+                            self.settings:flush()
+                            NetworkMgr:runWhenOnline(function()
+                                self:upload(true)
+                            end)
+                        end,
+                    },
+                },
             },
         },
     }
