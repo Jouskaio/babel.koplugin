@@ -6,6 +6,13 @@ statistics" and the yearly wrap, reading days and streaks (and so the badges).
 
 ## Install
 
+**Easiest: KOReader's App Store.** Install the
+[App Store plugin](https://github.com/omer-faruq/appstore.koplugin), open Tools › App Store and
+look for "babel.koplugin" (`Jouskaio/babel.koplugin`): it installs the plugin and keeps it
+up to date.
+
+**By hand:**
+
 1. Download `babel.koplugin.zip` from the "Download" page of your Babel site (or zip the
    `babel.koplugin` folder of this repository).
 2. Unzip it and copy the `babel.koplugin` folder into KOReader's `plugins` folder on the
