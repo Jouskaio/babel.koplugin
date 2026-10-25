@@ -1,0 +1,235 @@
+--[[
+Babel: sends KOReader's reading statistics to your Babel server.
+
+It reads statistics.sqlite3 (what the "Reading statistics" plugin records) and sends, for each
+book, how long and how many pages you read each day. Babel adds them to your own statistics
+(reading time, reading days, streaks). It uses the server address and the login of KOReader's
+"Progress sync" plugin: set that up first (Tools > Progress sync > Custom sync server).
+
+Menu: Tools > Babel.
+--]]
+
+local DataStorage = require("datastorage")
+local InfoMessage = require("ui/widget/infomessage")
+local JSON = require("json")
+local LuaSettings = require("luasettings")
+local NetworkMgr = require("ui/network/manager")
+local SQ3 = require("lua-ljsqlite3/init")
+local UIManager = require("ui/uimanager")
+local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local ltn12 = require("ltn12")
+local logger = require("logger")
+local socket = require("socket")
+local socketutil = require("socketutil")
+local _ = require("gettext")
+local T = require("ffi/util").template
+
+local DAY = 24 * 60 * 60
+
+local Babel = WidgetContainer:extend{
+    name = "babel",
+    is_doc_only = false,
+}
+
+function Babel:init()
+    self.settings = LuaSettings:open(DataStorage:getSettingsDir() .. "/babel.lua")
+    self.ui.menu:registerToMainMenu(self)
+end
+
+-- The server and the login of the Progress sync plugin.
+function Babel:login()
+    -- Progress sync keeps them in kosync.lua, under the "settings" table.
+    local sync = LuaSettings:open(DataStorage:getSettingsDir() .. "/kosync.lua")
+    local conf = sync:readSetting("settings")
+    if type(conf) ~= "table" then
+        conf = {
+            custom_server = sync:readSetting("custom_server"),
+            username = sync:readSetting("username"),
+            userkey = sync:readSetting("userkey"),
+        }
+    end
+    local server, user, key = conf.custom_server, conf.username, conf.userkey
+    if not server or server == "" or not user or not key then
+        local seen = {}
+        for name in pairs(sync.data or {}) do
+            seen[#seen + 1] = tostring(name)
+        end
+        return nil, string.format(
+            "%s (server %s, e-mail %s, key %s; found: %s)",
+            sync.file or "kosync.lua",
+            server and "ok" or "missing",
+            user and "ok" or "missing",
+            key and "ok" or "missing",
+            #seen > 0 and table.concat(seen, ", ") or "nothing"
+        )
+    end
+    return (server:gsub("/+$", "")), user, key
+end
+
+-- Midnight (local time) of the day [days] before [from].
+local function midnight(from, days)
+    local t = os.date("*t", from - days * DAY)
+    t.hour, t.min, t.sec = 0, 0, 0
+    return os.time(t)
+end
+
+-- Books and days read since [since] (a timestamp), from the statistics database.
+function Babel:collect(since)
+    local path = DataStorage:getSettingsDir() .. "/statistics.sqlite3"
+    local conn = SQ3.open(path, "ro")
+    local books, days = {}, {}
+    local ok, err = pcall(function()
+        local res = conn:exec([[
+            SELECT md5, COALESCE(title, ''), COALESCE(authors, ''), COALESCE(pages, 0),
+                   COALESCE(last_open, 0), COALESCE(total_read_time, 0),
+                   COALESCE(total_read_pages, 0)
+            FROM book WHERE md5 IS NOT NULL AND md5 != '']])
+        if res and res[1] then
+            for i = 1, #res[1] do
+                books[#books + 1] = {
+                    md5 = res[1][i],
+                    title = res[2][i],
+                    authors = res[3][i],
+                    pages = tonumber(res[4][i]) or 0,
+                    last_open = tonumber(res[5][i]) or 0,
+                    total_read_time = tonumber(res[6][i]) or 0,
+                    total_read_pages = tonumber(res[7][i]) or 0,
+                }
+            end
+        end
+        res = conn:exec(string.format([[
+            SELECT b.md5, strftime('%%Y-%%m-%%d', p.start_time, 'unixepoch', 'localtime'),
+                   SUM(p.duration), COUNT(DISTINCT p.page)
+            FROM page_stat_data p JOIN book b ON b.id = p.id_book
+            WHERE p.start_time >= %d AND b.md5 IS NOT NULL AND b.md5 != ''
+            GROUP BY b.md5, 2]], since))
+        if res and res[1] then
+            for i = 1, #res[1] do
+                local seconds = tonumber(res[3][i]) or 0
+                if seconds > 0 then
+                    days[#days + 1] = {
+                        md5 = res[1][i],
+                        day = res[2][i],
+                        seconds = math.min(seconds, DAY),
+                        pages = tonumber(res[4][i]) or 0,
+                    }
+                end
+            end
+        end
+    end)
+    conn:close()
+    if not ok then
+        logger.warn("Babel: could not read the statistics", err)
+        return nil, err
+    end
+    return books, days
+end
+
+-- Sends the statistics. [verbose]: tell the reader how it went (a manual send).
+function Babel:upload(verbose)
+    local function say(text)
+        if verbose then
+            UIManager:show(InfoMessage:new{ text = text })
+        end
+    end
+    local server, user, key = self:login()
+    if not server then
+        say(_("Set up Progress sync first (Tools > Progress sync > Custom sync server), with the address, e-mail and password from Babel.") .. "\n\nBabel plugin 3: " .. tostring(user))
+        return
+    end
+    local last = self.settings:readSetting("last_upload")
+    -- A little before the last send, from midnight: a day is always sent whole.
+    local since = last and midnight(last, 2) or 0
+    local books, days = self:collect(since)
+    if not books then
+        say(_("Could not read the reading statistics. Is the Reading statistics plugin enabled?"))
+        return
+    end
+    if #books == 0 then
+        say(_("No reading statistics yet. Read a book for a while, then try again."))
+        return
+    end
+    local body = JSON.encode({ books = books, days = days })
+    local url = server .. "/syncs/stats"
+    local request = url:match("^https") and require("ssl.https").request
+        or require("socket.http").request
+    local sink = {}
+    socketutil:set_timeout(15, 90)
+    local code = socket.skip(1, request{
+        url = url,
+        method = "PUT",
+        headers = {
+            ["Content-Type"] = "application/json",
+            ["Content-Length"] = tostring(#body),
+            ["Accept"] = "application/vnd.koreader.v1+json",
+            ["x-auth-user"] = user,
+            ["x-auth-key"] = key,
+        },
+        source = ltn12.source.string(body),
+        sink = ltn12.sink.table(sink),
+    })
+    socketutil:reset_timeout()
+    if code == 200 then
+        self.settings:saveSetting("last_upload", os.time())
+        self.settings:flush()
+        say(T(_("Sent to Babel: %1 books, %2 days of reading."), #books, #days))
+    elseif code == 401 then
+        say(_("Babel refused the login. Check the e-mail and the KOReader password in Progress sync."))
+    else
+        logger.warn("Babel: upload failed", code, table.concat(sink))
+        say(T(_("Could not send the statistics to Babel (%1)."), tostring(code)))
+    end
+end
+
+function Babel:onCloseDocument()
+    if self.settings:readSetting("auto_upload") == false then
+        return
+    end
+    -- A few seconds later, once the Reading statistics plugin has saved the session; and only
+    -- when the e-reader is already online (nothing is switched on for this).
+    UIManager:scheduleIn(5, function()
+        if NetworkMgr:isConnected() then
+            self:upload(false)
+        end
+    end)
+end
+
+function Babel:addToMainMenu(menu_items)
+    menu_items.babel = {
+        text = _("Babel"),
+        sorting_hint = "tools",
+        sub_item_table = {
+            {
+                text = _("Send reading statistics now"),
+                callback = function()
+                    NetworkMgr:runWhenOnline(function()
+                        self:upload(true)
+                    end)
+                end,
+            },
+            {
+                text = _("Send automatically when closing a book"),
+                checked_func = function()
+                    return self.settings:readSetting("auto_upload") ~= false
+                end,
+                callback = function()
+                    local on = self.settings:readSetting("auto_upload") ~= false
+                    self.settings:saveSetting("auto_upload", not on)
+                    self.settings:flush()
+                end,
+            },
+            {
+                text = _("Send everything again"),
+                callback = function()
+                    self.settings:delSetting("last_upload")
+                    self.settings:flush()
+                    NetworkMgr:runWhenOnline(function()
+                        self:upload(true)
+                    end)
+                end,
+            },
+        },
+    }
+end
+
+return Babel
