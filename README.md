@@ -40,4 +40,15 @@ folder), named `Author - Title.epub`:
 - A book downloaded this way is the very file of your library, so its reading progress syncs with
   Babel without any link to make.
 
+## Finished books, highlights, clean-up
+
+- When you close a book you marked as finished, Babel marks it finished too (and it leaves the
+  list of books to download).
+- Your highlights and notes are sent to Babel as annotations (each is sent once).
+- *Remove finished books from the Babel folder* (off by default) deletes, from the Babel folder,
+  the books this plugin downloaded that are no longer on the e-reader list. It never deletes a
+  file it did not download.
+- *Test the connection to Babel* tells you whether the e-reader reaches Babel and is logged in.
+- Each of these can be switched off in Tools › Babel.
+
 The data stays between your e-reader and your Babel server.

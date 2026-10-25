@@ -244,11 +244,43 @@ function Babel:fetchBook(book, path)
     socketutil:reset_timeout()
     if code == 200 and lfs.attributes(tmp, "size") == book.size then
         os.rename(tmp, path)
+        local mine = self.settings:readSetting("downloaded") or {}
+        mine[book.sha256] = path
+        self.settings:saveSetting("downloaded", mine)
+        self.settings:flush()
         return true
     end
     os.remove(tmp)
     logger.warn("Babel: could not download", book.name, code)
     return false
+end
+
+-- Removes the books this plugin downloaded that are no longer on the list (finished, or taken
+-- off "On my e-reader"), when the reader asked for it. Never touches a file it did not download.
+function Babel:cleanUp(books, verbose)
+    if self.settings:readSetting("cleanup") ~= true then
+        return
+    end
+    local wanted = {}
+    for _i, book in ipairs(books) do
+        wanted[book.sha256] = true
+    end
+    local mine = self.settings:readSetting("downloaded") or {}
+    local removed = 0
+    for sha, path in pairs(mine) do
+        if not wanted[sha] then
+            if lfs.attributes(path, "mode") == "file" then
+                os.remove(path)
+                removed = removed + 1
+            end
+            mine[sha] = nil
+        end
+    end
+    self.settings:saveSetting("downloaded", mine)
+    self.settings:flush()
+    if removed > 0 and verbose then
+        UIManager:show(InfoMessage:new{ text = T(_("%1 books removed from the e-reader."), removed), timeout = 4 })
+    end
 end
 
 -- Brings the books of the library missing from the e-reader, one per tick so the screen stays alive.
@@ -271,6 +303,7 @@ function Babel:download(verbose)
     end
     local dir = self:downloadDir()
     lfs.mkdir(dir)
+    self:cleanUp(data.books or {}, verbose)
     local queue = {}
     for _i, book in ipairs(data.books or {}) do
         local path = dir .. "/" .. safeName(book.name)
@@ -323,6 +356,96 @@ function Babel:download(verbose)
     step()
 end
 
+-- Sends a JSON body with PUT; returns the HTTP code (nil when the network failed).
+function Babel:putJson(path, body)
+    local server, user, key = self:login()
+    if not server then
+        return "login"
+    end
+    local payload = JSON.encode(body)
+    local sink = {}
+    socketutil:set_timeout(15, 60)
+    local code = socket.skip(1, requester(server)({
+        url = server .. path,
+        method = "PUT",
+        headers = {
+            ["Content-Type"] = "application/json",
+            ["Content-Length"] = tostring(#payload),
+            ["Accept"] = "application/vnd.koreader.v1+json",
+            ["x-auth-user"] = user,
+            ["x-auth-key"] = key,
+        },
+        source = ltn12.source.string(payload),
+        sink = ltn12.sink.table(sink),
+    }))
+    socketutil:reset_timeout()
+    return code
+end
+
+-- Tells the reader whether the e-reader can reach Babel and is logged in.
+function Babel:testConnection()
+    local server, user = self:login()
+    if not server then
+        UIManager:show(InfoMessage:new{
+            text = _("Set up Progress sync first (Tools > Progress sync > Custom sync server), with the address, e-mail and password from Babel."),
+        })
+        return
+    end
+    local data, code = self:getJson("/users/auth")
+    local text
+    if data then
+        text = T(_("Connected to Babel as %1."), user)
+    elseif code == 401 then
+        text = _("Babel refused the login. Log in again in Progress sync with your e-mail and the KOReader password made in Babel (Account > KOReader).")
+    elseif code == nil or code == "timeout" then
+        text = T(_("Could not reach %1. Check that the e-reader is online and the address is right."), server)
+    else
+        text = T(_("Babel answered with an error (%1)."), tostring(code))
+    end
+    UIManager:show(InfoMessage:new{ text = text })
+end
+
+-- What this book says about being finished and about its highlights, read before it closes.
+function Babel:readBook()
+    local ok, book = pcall(function()
+        local document = self.ui.document
+        if not document then
+            return nil
+        end
+        local md5 = document.fastDigest and document:fastDigest()
+        if not md5 then
+            return nil
+        end
+        local summary = self.ui.doc_settings and self.ui.doc_settings:readSetting("summary") or {}
+        local pages = document.getPageCount and document:getPageCount() or 0
+        local notes = {}
+        local list = self.ui.annotation and self.ui.annotation.annotations or {}
+        for _i, a in ipairs(list) do
+            if a.text and a.text ~= "" then
+                notes[#notes + 1] = {
+                    text = a.text,
+                    note = a.note,
+                    datetime = a.datetime,
+                    percent = (pages > 0 and tonumber(a.pageno)) and (a.pageno / pages * 100) or nil,
+                }
+            end
+        end
+        return { md5 = md5, finished = summary.status == "complete", notes = notes }
+    end)
+    return ok and book or nil
+end
+
+-- Sends a closed book's finished state and highlights (the ones already sent are ignored by Babel).
+function Babel:syncBook(book)
+    local device = require("device").model or "e-reader"
+    if book.finished and self.settings:readSetting("sync_finished") ~= false then
+        self:putJson("/syncs/finished", { document = book.md5, device = device })
+    end
+    if #book.notes > 0 and self.settings:readSetting("sync_notes") ~= false then
+        self:putJson("/syncs/annotations", { document = book.md5, device = device, annotations = book.notes })
+    end
+end
+
 -- Online again: bring new books, at most once an hour.
 function Babel:onNetworkConnected()
     if self.settings:readSetting("auto_download") == false then
@@ -340,6 +463,14 @@ function Babel:onNetworkConnected()
 end
 
 function Babel:onCloseDocument()
+    local book = self:readBook()
+    if book and (book.finished or #book.notes > 0) then
+        UIManager:scheduleIn(8, function()
+            if NetworkMgr:isConnected() then
+                self:syncBook(book)
+            end
+        end)
+    end
     if self.settings:readSetting("auto_upload") == false then
         return
     end
@@ -413,6 +544,47 @@ function Babel:addToMainMenu(menu_items)
                 keep_menu_open = true,
                 callback = function()
                     UIManager:show(InfoMessage:new{ text = self:downloadDir() })
+                end,
+            },
+            {
+                text = _("Remove finished books from the Babel folder"),
+                checked_func = function()
+                    return self.settings:readSetting("cleanup") == true
+                end,
+                callback = function()
+                    local on = self.settings:readSetting("cleanup") == true
+                    self.settings:saveSetting("cleanup", not on)
+                    self.settings:flush()
+                end,
+            },
+            {
+                text = _("Tell Babel when I finish a book"),
+                checked_func = function()
+                    return self.settings:readSetting("sync_finished") ~= false
+                end,
+                callback = function()
+                    local on = self.settings:readSetting("sync_finished") ~= false
+                    self.settings:saveSetting("sync_finished", not on)
+                    self.settings:flush()
+                end,
+            },
+            {
+                text = _("Send my highlights and notes to Babel"),
+                checked_func = function()
+                    return self.settings:readSetting("sync_notes") ~= false
+                end,
+                callback = function()
+                    local on = self.settings:readSetting("sync_notes") ~= false
+                    self.settings:saveSetting("sync_notes", not on)
+                    self.settings:flush()
+                end,
+            },
+            {
+                text = _("Test the connection to Babel"),
+                callback = function()
+                    NetworkMgr:runWhenOnline(function()
+                        self:testConnection()
+                    end)
                 end,
             },
             {
