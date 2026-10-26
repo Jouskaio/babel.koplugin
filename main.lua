@@ -591,7 +591,7 @@ end
 
 -- Books on the e-reader (in KOReader's home folder, except the Babel folder) that Babel lacks.
 local BOOK_EXTENSIONS = { epub = true, pdf = true, cbz = true, cbr = true }
-local MAX_BOOK_BYTES = 300 * 1024 * 1024
+local MAX_BOOK_BYTES = 1000 * 1024 * 1024
 
 function Babel:findBooks(dir, found, skip)
     for name in lfs.dir(dir) do
