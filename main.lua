@@ -504,6 +504,59 @@ function Babel:readBook()
     return ok and book or nil
 end
 
+-- The reading progress of the books read lately (from KOReader's own records of each book):
+-- Babel shows it, and its reader opens the book there. Only what changed since the last send is
+-- sent, so an old position never overrides a newer one made elsewhere. Returns how many were sent.
+function Babel:pushProgress()
+    if self.settings:readSetting("sync_progress") == false then
+        return 0
+    end
+    local ok, history = pcall(require, "readhistory")
+    if not ok or not history or not history.hist then
+        return 0
+    end
+    local util = require("util")
+    local DocSettings = require("docsettings")
+    local sent = self.settings:readSetting("progress_sent") or {}
+    local count, looked = 0, 0
+    local recent = os.time() - 60 * DAY
+    for _i, entry in ipairs(history.hist) do
+        looked = looked + 1
+        if looked > 60 then
+            break
+        end
+        local path = entry.file
+        if path and (entry.time or 0) >= recent and lfs.attributes(path, "mode") == "file" then
+            local done, found = pcall(function()
+                local doc = DocSettings:open(path)
+                local percent = doc:readSetting("percent_finished")
+                if not percent or percent <= 0 then
+                    return nil
+                end
+                local md5 = doc:readSetting("partial_md5_checksum") or util.partialMD5(path)
+                local position = doc:readSetting("last_xpointer") or tostring(doc:readSetting("last_page") or "")
+                return { md5 = md5, percent = percent, position = position }
+            end)
+            if done and found and found.md5 and math.abs((sent[found.md5] or -1) - found.percent) > 0.001 then
+                local code = self:putJson("/syncs/progress", {
+                    document = found.md5,
+                    progress = found.position,
+                    percentage = found.percent,
+                    device = deviceName(),
+                    device_id = deviceName(),
+                })
+                if code == 200 then
+                    sent[found.md5] = found.percent
+                    count = count + 1
+                end
+            end
+        end
+    end
+    self.settings:saveSetting("progress_sent", sent)
+    self.settings:flush()
+    return count
+end
+
 -- Sends a closed book's finished state and highlights (the ones already sent are ignored by Babel).
 function Babel:syncBook(book)
     local device = require("device").model or "e-reader"
@@ -756,6 +809,10 @@ function Babel:syncAll(verbose)
     if ok then
         report[#report + 1] = T(_("Statistics sent: %1 books, %2 days."), books, days)
     end
+    local progressed = self:pushProgress()
+    if progressed > 0 then
+        report[#report + 1] = T(_("Reading progress sent: %1 books."), progressed)
+    end
     self:sendBooks(false, function(sent, sendFailed)
         if sent > 0 or sendFailed > 0 then
             report[#report + 1] = T(_("Books sent to Babel: %1 (%2 failed)."), sent, sendFailed)
@@ -793,6 +850,11 @@ function Babel:onNetworkConnected()
 end
 
 function Babel:onCloseDocument()
+    UIManager:scheduleIn(10, function()
+        if NetworkMgr:isConnected() then
+            self:pushProgress()
+        end
+    end)
     local book = self:readBook()
     if book and (book.finished or #book.notes > 0) then
         UIManager:scheduleIn(8, function()
@@ -904,6 +966,17 @@ function Babel:addToMainMenu(menu_items)
                         callback = function()
                             local on = self.settings:readSetting("cleanup") == true
                             self.settings:saveSetting("cleanup", not on)
+                            self.settings:flush()
+                        end,
+                    },
+                    {
+                        text = _("Send my reading progress to Babel"),
+                        checked_func = function()
+                            return self.settings:readSetting("sync_progress") ~= false
+                        end,
+                        callback = function()
+                            local on = self.settings:readSetting("sync_progress") ~= false
+                            self.settings:saveSetting("sync_progress", not on)
                             self.settings:flush()
                         end,
                     },

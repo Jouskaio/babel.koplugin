@@ -42,7 +42,8 @@ folder), named `Author - Title.epub`:
 
 ## One button
 
-Tools › Babel › **Sync with Babel** does it all, in this order: sends the reading statistics, sends
+Tools › Babel › **Sync with Babel** does it all, in this order: sends the reading statistics and the reading
+progress of the books read lately (Babel shows it, and its reader opens the book there), sends
 the e-reader's books Babel lacks, downloads the books marked "On my e-reader" (a book already on
 the e-reader, in any folder, is not downloaded again), then tidies the Babel folder: a copy of a
 book that is also elsewhere on the e-reader is removed (the original stays), and finished books
