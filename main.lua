@@ -158,6 +158,27 @@ function Babel:collect(since)
                 }
             end
         end
+        -- Where the last session of each book ended: the reader is about there. Optional (older
+        -- statistics have no total page count), so a failure here costs nothing else.
+        pcall(function()
+            local last = conn:exec([[
+                SELECT b.md5, p.page, COALESCE(p.total_pages, b.pages, 0)
+                FROM page_stat_data p JOIN book b ON b.id = p.id_book
+                WHERE b.md5 IS NOT NULL AND b.md5 != ''
+                  AND p.start_time = (SELECT MAX(start_time) FROM page_stat_data WHERE id_book = p.id_book)]])
+            if last and last[1] then
+                local reached = {}
+                for i = 1, #last[1] do
+                    local page, total = tonumber(last[2][i]) or 0, tonumber(last[3][i]) or 0
+                    if total > 0 and page > 0 then
+                        reached[last[1][i]] = math.min(1, page / total)
+                    end
+                end
+                for _i, book in ipairs(books) do
+                    book.progress = reached[book.md5]
+                end
+            end
+        end)
         res = conn:exec(string.format([[
             SELECT b.md5, strftime('%%Y-%%m-%%d', p.start_time, 'unixepoch', 'localtime'),
                    SUM(p.duration), COUNT(DISTINCT p.page)
