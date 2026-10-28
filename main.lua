@@ -307,6 +307,7 @@ local function safeName(name)
 end
 
 -- Downloads one book to [path] (through a temporary file, so a failure leaves nothing half-written).
+-- Runs in the background process: the caller records the result.
 function Babel:fetchBook(book, path)
     local server, user, key = self:login()
     local tmp = path .. ".part"
@@ -322,17 +323,87 @@ function Babel:fetchBook(book, path)
         sink = ltn12.sink.file(file),
     }))
     socketutil:reset_timeout()
+    pcall(file.close, file)
     if code == 200 and lfs.attributes(tmp, "size") == book.size then
         os.rename(tmp, path)
-        local mine = self.settings:readSetting("downloaded") or {}
-        mine[book.sha256] = path
-        self.settings:saveSetting("downloaded", mine)
-        self.settings:flush()
         return true
     end
     os.remove(tmp)
     logger.warn("Babel: could not download", book.name, code)
     return false
+end
+
+-- Runs [work(report)] in a separate process, so the e-reader stays usable (and a crash there
+-- cannot take KOReader down). [report(line)] sends a line back; the parent calls [on_tick(lines)]
+-- while it runs and [on_done(lines)] at the end. Returns false when it could not start.
+function Babel:background(work, on_tick, on_done)
+    local ffiutil = require("ffi/util")
+    local log = DataStorage:getSettingsDir() .. "/babel-job.log"
+    os.remove(log)
+    local pid = ffiutil.runInSubProcess(function()
+        local function report(line)
+            local f = io.open(log, "ab")
+            if f then
+                f:write((line:gsub("\n", " ")), "\n")
+                f:close()
+            end
+        end
+        local ok, err = pcall(work, report)
+        if not ok then
+            report("error\t" .. tostring(err))
+        end
+    end)
+    if not pid then
+        return false
+    end
+    local function lines()
+        local out = {}
+        local f = io.open(log, "rb")
+        if f then
+            for line in f:lines() do
+                out[#out + 1] = line
+            end
+            f:close()
+        end
+        return out
+    end
+    local function poll()
+        if ffiutil.isSubProcessDone(pid) then
+            local all = lines()
+            os.remove(log)
+            on_done(all)
+        else
+            on_tick(lines())
+            UIManager:scheduleIn(2, poll)
+        end
+    end
+    UIManager:scheduleIn(2, poll)
+    return true
+end
+
+-- The last "progress" line of a job: "Downloading from Babel (3/40): name".
+local function lastProgress(lines, label)
+    for i = #lines, 1, -1 do
+        local n, total, name = lines[i]:match("^progress\t(%d+)\t(%d+)\t(.*)$")
+        if n then
+            return T(label, n, total, name)
+        end
+    end
+end
+
+local function countLines(lines)
+    local done, failed, none = 0, 0, false
+    for _i, line in ipairs(lines) do
+        local kind = line:match("^(%a+)")
+        if kind == "ok" then
+            done = done + 1
+        elseif kind == "fail" or kind == "error" then
+            failed = failed + 1
+        elseif kind == "none" then
+            none = true
+        end
+    end
+    return done, failed, none
 end
 
 -- Removes the books this plugin downloaded that are no longer on the list (finished, or taken
@@ -363,7 +434,7 @@ function Babel:cleanUp(books, verbose)
     end
 end
 
--- Brings the books of the library missing from the e-reader, one per tick so the screen stays alive.
+-- Brings the books of the library missing from the e-reader, in the background.
 -- [verbose]: tell the reader how it went (a manual download).
 function Babel:download(verbose, finished)
     local function stop(done, failed)
@@ -372,7 +443,7 @@ function Babel:download(verbose, finished)
         end
     end
     if self.downloading then
-        return stop(done, failed)
+        return stop()
     end
     local scope = self.settings:readSetting("download_scope") or "ereader"
     local data, code = self:getJson("/library?scope=" .. scope)
@@ -384,66 +455,77 @@ function Babel:download(verbose, finished)
                     or T(_("Could not reach Babel (%1)."), tostring(code)),
             })
         end
-        return stop(done, failed)
+        return stop()
     end
     local dir = self:downloadDir()
     lfs.mkdir(dir)
     self:cleanUp(data.books or {}, verbose)
-    local queue = {}
-    -- A book already on the e-reader, wherever it is, is not downloaded a second time.
-    local here = self:localIndex()
-    for _i, book in ipairs(data.books or {}) do
-        local path = dir .. "/" .. safeName(book.name)
-        local present = (book.md5 and book.md5 ~= "" and here[book.md5]) or lfs.attributes(path, "size") == book.size
-        if not present then
-            queue[#queue + 1] = { book = book, path = path }
-        end
-    end
-    if #queue == 0 then
-        if verbose then
-            UIManager:show(InfoMessage:new{ text = _("Your Babel books are all on the e-reader.") })
-        end
-        return stop(done, failed)
-    end
+    local books = data.books or {}
+    local Notification = require("ui/widget/notification")
     self.downloading = true
-    local done, failed, index = 0, 0, 0
-    local notice
-    local function step()
-        if notice then
-            UIManager:close(notice)
-        end
-        index = index + 1
-        local job = queue[index]
-        if not job then
-            self.downloading = false
-            local FileManager = require("apps/filemanager/filemanager")
-            if FileManager.instance then
-                FileManager.instance:onRefresh()
+    local started = self:background(function(report)
+        -- A book already on the e-reader, wherever it is, is not downloaded a second time.
+        local here = self:localIndex()
+        local queue = {}
+        for _i, book in ipairs(books) do
+            local path = dir .. "/" .. safeName(book.name)
+            local present = (book.md5 and book.md5 ~= "" and here[book.md5]) or lfs.attributes(path, "size") == book.size
+            if not present then
+                queue[#queue + 1] = { book = book, path = path }
             end
-            if not finished then
-                UIManager:show(InfoMessage:new{
-                    text = failed == 0 and T(_("%1 books downloaded from Babel."), done)
-                        or T(_("%1 books downloaded from Babel, %2 failed."), done, failed),
-                    timeout = 5,
-                })
-            end
-            return stop(done, failed)
         end
-        notice = InfoMessage:new{
-            text = T(_("Downloading from Babel (%1/%2): %3"), index, #queue, job.book.name),
-        }
-        UIManager:show(notice)
-        UIManager:forceRePaint()
-        UIManager:scheduleIn(0.2, function()
+        if #queue == 0 then
+            report("none")
+            return
+        end
+        for i, job in ipairs(queue) do
+            report(("progress\t%d\t%d\t%s"):format(i, #queue, job.book.name))
             if self:fetchBook(job.book, job.path) then
-                done = done + 1
+                report("ok\t" .. job.book.sha256 .. "\t" .. job.path)
             else
-                failed = failed + 1
+                report("fail\t" .. job.book.name)
             end
-            step()
-        end)
+        end
+    end, function(lines)
+        if verbose then
+            local text = lastProgress(lines, _("Downloading from Babel (%1/%2): %3"))
+            if text then
+                Notification:notify(text)
+            end
+        end
+    end, function(lines)
+        self.downloading = false
+        local mine = self.settings:readSetting("downloaded") or {}
+        for _i, line in ipairs(lines) do
+            local sha, path = line:match("^ok\t([^\t]+)\t(.*)$")
+            if sha then
+                mine[sha] = path
+            end
+        end
+        self.settings:saveSetting("downloaded", mine)
+        self.settings:flush()
+        local done, failed, none = countLines(lines)
+        local FileManager = require("apps/filemanager/filemanager")
+        if FileManager.instance then
+            FileManager.instance:onRefresh()
+        end
+        if not finished and (verbose or done + failed > 0) then
+            UIManager:show(InfoMessage:new{
+                text = none and _("Your Babel books are all on the e-reader.")
+                    or failed == 0 and T(_("%1 books downloaded from Babel."), done)
+                    or T(_("%1 books downloaded from Babel, %2 failed."), done, failed),
+                timeout = 5,
+            })
+        end
+        stop(done, failed)
+    end)
+    if not started then
+        self.downloading = false
+        return stop()
     end
-    step()
+    if verbose then
+        Notification:notify(_("Downloading from Babel in the background…"))
+    end
 end
 
 -- Sends a JSON body with PUT; returns the HTTP code (nil when the network failed).
@@ -611,8 +693,8 @@ function Babel:findBooks(dir, found, skip)
     return found
 end
 
--- Sends Babel the e-reader's books it does not have; Babel marks them "On my e-reader".
--- One book per tick so the screen stays alive.
+-- Sends Babel the e-reader's books it does not have, in the background; Babel marks them
+-- "On my e-reader".
 function Babel:sendBooks(verbose, finished)
     local function stop(done, failed)
         if finished then
@@ -620,7 +702,7 @@ function Babel:sendBooks(verbose, finished)
         end
     end
     if self.sending then
-        return stop(done, failed)
+        return stop()
     end
     local server, user, key = self:login()
     if not server then
@@ -629,87 +711,64 @@ function Babel:sendBooks(verbose, finished)
                 text = _("Set up Progress sync first (Tools > Progress sync > Custom sync server), with the address, e-mail and password from Babel."),
             })
         end
-        return stop(done, failed)
+        return stop()
     end
-    local home = G_reader_settings:readSetting("home_dir") or "/sdcard/Books"
-    local books = {}
-    pcall(function()
-        self:findBooks(home, books, self:downloadDir())
-    end)
-    local util = require("util")
-    local byDocument, documents = {}, {}
-    for _i, book in ipairs(books) do
-        local ok, md5 = pcall(util.partialMD5, book.path)
-        if ok and md5 then
-            byDocument[md5] = book
-            documents[#documents + 1] = md5
-        end
-    end
-    local queue = {}
-    for first = 1, #documents, 200 do
-        local batch = {}
-        for i = first, math.min(first + 199, #documents) do
-            batch[#batch + 1] = documents[i]
-        end
-        local payload = JSON.encode({ documents = batch, device = deviceName() })
-        local sink = {}
-        socketutil:set_timeout(15, 60)
-        local code = socket.skip(1, requester(server)({
-            url = server .. "/library/missing",
-            method = "POST",
-            headers = {
-                ["Content-Type"] = "application/json",
-                ["Content-Length"] = tostring(#payload),
-                ["x-auth-user"] = user,
-                ["x-auth-key"] = key,
-            },
-            source = ltn12.source.string(payload),
-            sink = ltn12.sink.table(sink),
-        }))
-        socketutil:reset_timeout()
-        if code ~= 200 then
-            if verbose then
-                UIManager:show(InfoMessage:new{ text = T(_("Could not reach Babel (%1)."), tostring(code)) })
-            end
-            return stop(done, failed)
-        end
-        local ok, data = pcall(JSON.decode, table.concat(sink))
-        for _i, md5 in ipairs(ok and data and data.missing or {}) do
-            if byDocument[md5] then
-                queue[#queue + 1] = byDocument[md5]
-            end
-        end
-    end
-    if #queue == 0 then
-        if verbose then
-            UIManager:show(InfoMessage:new{ text = _("Babel already has all the books of this e-reader.") })
-        end
-        return stop(done, failed)
-    end
+    local Notification = require("ui/widget/notification")
     self.sending = true
-    local done, failed, index = 0, 0, 0
-    local notice
-    local function step()
-        if notice then
-            UIManager:close(notice)
-        end
-        index = index + 1
-        local job = queue[index]
-        if not job then
-            self.sending = false
-            if not finished then
-                UIManager:show(InfoMessage:new{
-                    text = failed == 0 and T(_("%1 books sent to Babel."), done)
-                        or T(_("%1 books sent to Babel, %2 failed."), done, failed),
-                    timeout = 5,
-                })
+    local started = self:background(function(report)
+        local home = G_reader_settings:readSetting("home_dir") or "/sdcard/Books"
+        local books = {}
+        pcall(function()
+            self:findBooks(home, books, self:downloadDir())
+        end)
+        local util = require("util")
+        local byDocument, documents = {}, {}
+        for _i, book in ipairs(books) do
+            local ok, md5 = pcall(util.partialMD5, book.path)
+            if ok and md5 then
+                byDocument[md5] = book
+                documents[#documents + 1] = md5
             end
-            return stop(done, failed)
         end
-        notice = InfoMessage:new{ text = T(_("Sending to Babel (%1/%2): %3"), index, #queue, job.name) }
-        UIManager:show(notice)
-        UIManager:forceRePaint()
-        UIManager:scheduleIn(0.2, function()
+        local queue = {}
+        for first = 1, #documents, 200 do
+            local batch = {}
+            for i = first, math.min(first + 199, #documents) do
+                batch[#batch + 1] = documents[i]
+            end
+            local payload = JSON.encode({ documents = batch, device = deviceName() })
+            local sink = {}
+            socketutil:set_timeout(15, 60)
+            local code = socket.skip(1, requester(server)({
+                url = server .. "/library/missing",
+                method = "POST",
+                headers = {
+                    ["Content-Type"] = "application/json",
+                    ["Content-Length"] = tostring(#payload),
+                    ["x-auth-user"] = user,
+                    ["x-auth-key"] = key,
+                },
+                source = ltn12.source.string(payload),
+                sink = ltn12.sink.table(sink),
+            }))
+            socketutil:reset_timeout()
+            if code ~= 200 then
+                report("error\tcode " .. tostring(code))
+                return
+            end
+            local ok, data = pcall(JSON.decode, table.concat(sink))
+            for _i, md5 in ipairs(ok and data and data.missing or {}) do
+                if byDocument[md5] then
+                    queue[#queue + 1] = byDocument[md5]
+                end
+            end
+        end
+        if #queue == 0 then
+            report("none")
+            return
+        end
+        for i, job in ipairs(queue) do
+            report(("progress\t%d\t%d\t%s"):format(i, #queue, job.name))
             local file = io.open(job.path, "rb")
             local code
             if file then
@@ -728,17 +787,37 @@ function Babel:sendBooks(verbose, finished)
                     sink = ltn12.sink.null(),
                 }))
                 socketutil:reset_timeout()
+                pcall(file.close, file)
             end
-            if code == 200 then
-                done = done + 1
-            else
-                failed = failed + 1
-                logger.warn("Babel: could not send", job.name, code)
+            report((code == 200 and "ok\t" or "fail\t") .. job.name)
+        end
+    end, function(lines)
+        if verbose then
+            local text = lastProgress(lines, _("Sending to Babel (%1/%2): %3"))
+            if text then
+                Notification:notify(text)
             end
-            step()
-        end)
+        end
+    end, function(lines)
+        self.sending = false
+        local done, failed, none = countLines(lines)
+        if not finished and (verbose or done + failed > 0) then
+            UIManager:show(InfoMessage:new{
+                text = none and _("Babel already has all the books of this e-reader.")
+                    or failed == 0 and T(_("%1 books sent to Babel."), done)
+                    or T(_("%1 books sent to Babel, %2 failed."), done, failed),
+                timeout = 5,
+            })
+        end
+        stop(done, failed)
+    end)
+    if not started then
+        self.sending = false
+        return stop()
     end
-    step()
+    if verbose then
+        Notification:notify(_("Sending to Babel in the background…"))
+    end
 end
 
 -- Every book of the e-reader by KOReader's identifier (partial md5): identifier -> list of paths.

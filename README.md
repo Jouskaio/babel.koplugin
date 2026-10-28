@@ -36,7 +36,7 @@ folder), named `Author - Title.epub`:
   library* in Tools › Babel.
 - Tools › Babel › *Download my Babel books now*, or leave *Download new books when online* on: when
   the e-reader goes online it checks, at most once an hour, and downloads what is missing, one book
-  after the other.
+  after the other, in a background process: the e-reader stays usable meanwhile.
 - A book downloaded this way is the very file of your library, so its reading progress syncs with
   Babel without any link to make.
 
