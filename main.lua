@@ -44,6 +44,7 @@ local Babel = WidgetContainer:extend{
 
 function Babel:init()
     self.settings = LuaSettings:open(DataStorage:getSettingsDir() .. "/babel.lua")
+    self.jobs = {}
     self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
 end
@@ -306,12 +307,22 @@ local function safeName(name)
     return (name:gsub("[/\\:*?\"<>|%c]", "_"))
 end
 
--- Downloads one book to [path] (through a temporary file, so a failure leaves nothing half-written).
+-- Downloads one book to [path] through a temporary file, so a failure leaves no half-written
+-- book. A partial file is continued where it stopped (big comics rarely arrive in one go).
 -- Runs in the background process: the caller records the result.
 function Babel:fetchBook(book, path)
     local server, user, key = self:login()
     local tmp = path .. ".part"
-    local file = io.open(tmp, "wb")
+    local have = lfs.attributes(tmp, "size") or 0
+    if have >= book.size then
+        os.remove(tmp)
+        have = 0
+    end
+    local headers = { ["x-auth-user"] = user, ["x-auth-key"] = key }
+    if have > 0 then
+        headers["Range"] = "bytes=" .. have .. "-"
+    end
+    local file = io.open(tmp, have > 0 and "ab" or "wb")
     if not file then
         return false
     end
@@ -319,16 +330,31 @@ function Babel:fetchBook(book, path)
     local code = socket.skip(1, requester(server)({
         url = server .. "/library/files/" .. book.sha256 .. "?device=" .. require("socket.url").escape(deviceName()),
         method = "GET",
-        headers = { ["x-auth-user"] = user, ["x-auth-key"] = key },
+        headers = headers,
         sink = ltn12.sink.file(file),
     }))
     socketutil:reset_timeout()
     pcall(file.close, file)
-    if code == 200 and lfs.attributes(tmp, "size") == book.size then
+    if code == 200 and have > 0 then
+        -- The server sent everything again: start over.
+        have = 0
+        local whole = io.open(tmp, "rb")
+        local size = whole and whole:seek("end") or 0
+        if whole then
+            whole:close()
+        end
+        if size > book.size then
+            os.remove(tmp)
+            return false
+        end
+    end
+    if (code == 200 or code == 206) and lfs.attributes(tmp, "size") == book.size then
         os.rename(tmp, path)
         return true
     end
-    os.remove(tmp)
+    if code ~= 206 and code ~= 200 then
+        os.remove(tmp)
+    end
     logger.warn("Babel: could not download", book.name, code)
     return false
 end
@@ -384,7 +410,7 @@ end
 -- The last "progress" line of a job: "Downloading from Babel (3/40): name".
 local function lastProgress(lines, label)
     for i = #lines, 1, -1 do
-        local n, total, name = lines[i]:match("^progress\t(%d+)\t(%d+)\t(.*)$")
+        local n, total, _size, name = lines[i]:match("^progress\t(%d+)\t(%d+)\t(%d+)\t(.*)$")
         if n then
             return T(label, n, total, name)
         end
@@ -463,6 +489,7 @@ function Babel:download(verbose, finished)
     local books = data.books or {}
     local Notification = require("ui/widget/notification")
     self.downloading = true
+    self.jobs.download, self.jobs.downloadEnded = {}, false
     local started = self:background(function(report)
         -- A book already on the e-reader, wherever it is, is not downloaded a second time.
         local here = self:localIndex()
@@ -479,7 +506,7 @@ function Babel:download(verbose, finished)
             return
         end
         for i, job in ipairs(queue) do
-            report(("progress\t%d\t%d\t%s"):format(i, #queue, job.book.name))
+            report(("progress\t%d\t%d\t%d\t%s"):format(i, #queue, job.book.size or 0, (job.book.name:gsub("\t", " "))))
             if self:fetchBook(job.book, job.path) then
                 report("ok\t" .. job.book.sha256 .. "\t" .. job.path)
             else
@@ -487,6 +514,7 @@ function Babel:download(verbose, finished)
             end
         end
     end, function(lines)
+        self.jobs.download = lines
         if verbose then
             local text = lastProgress(lines, _("Downloading from Babel (%1/%2): %3"))
             if text then
@@ -495,6 +523,8 @@ function Babel:download(verbose, finished)
         end
     end, function(lines)
         self.downloading = false
+        self.jobs.download = lines
+        self.jobs.downloadEnded = true
         local mine = self.settings:readSetting("downloaded") or {}
         for _i, line in ipairs(lines) do
             local sha, path = line:match("^ok\t([^\t]+)\t(.*)$")
@@ -715,6 +745,7 @@ function Babel:sendBooks(verbose, finished)
     end
     local Notification = require("ui/widget/notification")
     self.sending = true
+    self.jobs.send, self.jobs.sendEnded = {}, false
     local started = self:background(function(report)
         local home = G_reader_settings:readSetting("home_dir") or "/sdcard/Books"
         local books = {}
@@ -768,7 +799,7 @@ function Babel:sendBooks(verbose, finished)
             return
         end
         for i, job in ipairs(queue) do
-            report(("progress\t%d\t%d\t%s"):format(i, #queue, job.name))
+            report(("progress\t%d\t%d\t%d\t%s"):format(i, #queue, job.size or 0, (job.name:gsub("\t", " "))))
             local file = io.open(job.path, "rb")
             local code
             if file then
@@ -792,6 +823,7 @@ function Babel:sendBooks(verbose, finished)
             report((code == 200 and "ok\t" or "fail\t") .. job.name)
         end
     end, function(lines)
+        self.jobs.send = lines
         if verbose then
             local text = lastProgress(lines, _("Sending to Babel (%1/%2): %3"))
             if text then
@@ -800,6 +832,8 @@ function Babel:sendBooks(verbose, finished)
         end
     end, function(lines)
         self.sending = false
+        self.jobs.send = lines
+        self.jobs.sendEnded = true
         local done, failed, none = countLines(lines)
         if not finished and (verbose or done + failed > 0) then
             UIManager:show(InfoMessage:new{
@@ -975,6 +1009,68 @@ function Babel:onCloseDocument()
     end)
 end
 
+-- The plugin's own version (from _meta.lua).
+function Babel:version()
+    local here = debug.getinfo(1, "S").source:match("^@(.*)/[^/]*$")
+    local ok, meta = pcall(dofile, (here or ".") .. "/_meta.lua")
+    return ok and type(meta) == "table" and meta.version or "?"
+end
+
+local function megabytes(bytes)
+    return ("%.1f"):format((bytes or 0) / 1048576)
+end
+
+-- One job in words: where it is now, how many are done, what failed.
+function Babel:jobText(title, lines, ended, partOf)
+    if not lines or #lines == 0 then
+        return title .. ": " .. (ended and _("nothing to do.") or _("not started."))
+    end
+    local done, failed, none = countLines(lines)
+    local text = { title .. ": " .. (ended and _("finished.") or _("running…")) }
+    local n, total, size, name
+    for i = #lines, 1, -1 do
+        n, total, size, name = lines[i]:match("^progress\t(%d+)\t(%d+)\t(%d+)\t(.*)$")
+        if n then
+            break
+        end
+    end
+    if n and not ended then
+        local line = T(_("Book %1 of %2: %3"), n, total, name)
+        local got = partOf and partOf(name)
+        if got and tonumber(size) > 0 then
+            line = line .. ("\n%s / %s MB (%d%%)"):format(megabytes(got), megabytes(tonumber(size)), math.floor(got * 100 / tonumber(size)))
+        end
+        text[#text + 1] = line
+    end
+    text[#text + 1] = T(_("Done: %1, failed: %2."), done, failed)
+    if none then
+        text[#text + 1] = _("Nothing was missing.")
+    end
+    for i = #lines, 1, -1 do
+        local err = lines[i]:match("^error\t(.*)$")
+        if err then
+            text[#text + 1] = T(_("Error: %1"), err)
+            break
+        end
+    end
+    return table.concat(text, "\n")
+end
+
+-- Shows where the background downloads and sends stand (also after they ended).
+function Babel:showStatus()
+    local dir = self:downloadDir()
+    local text = {
+        T(_("Babel plugin version %1"), self:version()),
+        "",
+        self:jobText(_("Downloads"), self.jobs.download, self.jobs.downloadEnded, function(name)
+            return lfs.attributes(dir .. "/" .. safeName(name) .. ".part", "size")
+        end),
+        "",
+        self:jobText(_("Sending"), self.jobs.send, self.jobs.sendEnded),
+    }
+    UIManager:show(InfoMessage:new{ text = table.concat(text, "\n") })
+end
+
 function Babel:addToMainMenu(menu_items)
     menu_items.babel = {
         text = _("Babel"),
@@ -986,6 +1082,12 @@ function Babel:addToMainMenu(menu_items)
                     NetworkMgr:runWhenOnline(function()
                         self:syncAll(true)
                     end)
+                end,
+            },
+            {
+                text = _("Downloads and version"),
+                callback = function()
+                    self:showStatus()
                 end,
             },
             {
