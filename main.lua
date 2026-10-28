@@ -1009,11 +1009,14 @@ function Babel:onCloseDocument()
     end)
 end
 
--- The plugin's own version (from _meta.lua).
-function Babel:version()
-    local here = debug.getinfo(1, "S").source:match("^@(.*)/[^/]*$")
-    local ok, meta = pcall(dofile, (here or ".") .. "/_meta.lua")
-    return ok and type(meta) == "table" and meta.version or "?"
+-- The plugin's own version (from _meta.lua). Not called "version": KOReader may set a field of
+-- that name on the plugin itself.
+function Babel:pluginVersion()
+    local ok, version = pcall(function()
+        local here = debug.getinfo(1, "S").source:match("^@(.*)/[^/]*$")
+        return dofile((here or ".") .. "/_meta.lua").version
+    end)
+    return ok and version or "?"
 end
 
 local function megabytes(bytes)
@@ -1058,9 +1061,14 @@ end
 
 -- Shows where the background downloads and sends stand (also after they ended).
 function Babel:showStatus()
+    local ok, err = pcall(self.buildStatus, self)
+    UIManager:show(InfoMessage:new{ text = ok and err or ("Babel: " .. tostring(err)) })
+end
+
+function Babel:buildStatus()
     local dir = self:downloadDir()
     local text = {
-        T(_("Babel plugin version %1"), self:version()),
+        T(_("Babel plugin version %1"), self:pluginVersion()),
         "",
         self:jobText(_("Downloads"), self.jobs.download, self.jobs.downloadEnded, function(name)
             return lfs.attributes(dir .. "/" .. safeName(name) .. ".part", "size")
@@ -1068,7 +1076,7 @@ function Babel:showStatus()
         "",
         self:jobText(_("Sending"), self.jobs.send, self.jobs.sendEnded),
     }
-    UIManager:show(InfoMessage:new{ text = table.concat(text, "\n") })
+    return table.concat(text, "\n")
 end
 
 function Babel:addToMainMenu(menu_items)
