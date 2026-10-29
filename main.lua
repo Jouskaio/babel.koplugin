@@ -461,6 +461,52 @@ function Babel:cleanUp(books, verbose)
 end
 
 -- Brings the books of the library missing from the e-reader, in the background.
+-- Gives each downloaded book the title, authors, series and volume Babel knows (KOReader's
+-- "custom metadata", next to the book: the file itself stays as it is, so its progress id holds).
+function Babel:applyMetadata(books)
+    local mine = self.settings:readSetting("downloaded") or {}
+    local dir = self:downloadDir()
+    for _i, book in ipairs(books or {}) do
+        local path = mine[book.sha256] or (dir .. "/" .. safeName(book.name))
+        pcall(function()
+            if lfs.attributes(path, "mode") ~= "file" then
+                return
+            end
+            local DocSettings = require("docsettings")
+            local LuaSettings = require("luasettings")
+            local sidecar = DocSettings:getSidecarDir(path)
+            lfs.mkdir(sidecar)
+            local settings = LuaSettings:open(sidecar .. "/custom_metadata.lua")
+            local props = {}
+            if book.title and book.title ~= "" then
+                props.title = book.title
+            end
+            if book.authors and book.authors ~= "" then
+                props.authors = book.authors
+            end
+            if book.series and book.series ~= "" then
+                local n = tonumber(book.series_index)
+                props.series = n and ("%s #%s"):format(book.series, n == math.floor(n) and ("%d"):format(n) or tostring(n)) or book.series
+            end
+            if next(props) == nil then
+                return
+            end
+            local old = settings:readSetting("custom_props") or {}
+            local same = true
+            for k, v in pairs(props) do
+                same = same and old[k] == v
+            end
+            if not same then
+                for k, v in pairs(props) do
+                    old[k] = v
+                end
+                settings:saveSetting("custom_props", old)
+                settings:flush()
+            end
+        end)
+    end
+end
+
 -- [verbose]: tell the reader how it went (a manual download).
 function Babel:download(verbose, finished)
     local function stop(done, failed)
@@ -534,6 +580,7 @@ function Babel:download(verbose, finished)
         end
         self.settings:saveSetting("downloaded", mine)
         self.settings:flush()
+        self:applyMetadata(books)
         local done, failed, none = countLines(lines)
         local FileManager = require("apps/filemanager/filemanager")
         if FileManager.instance then
