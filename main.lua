@@ -485,8 +485,8 @@ function Babel:applyMetadata(books)
                 props.authors = book.authors
             end
             if book.series and book.series ~= "" then
-                local n = tonumber(book.series_index)
-                props.series = n and ("%s #%s"):format(book.series, n == math.floor(n) and ("%d"):format(n) or tostring(n)) or book.series
+                props.series = book.series
+                props.series_index = tonumber(book.series_index)
             end
             if next(props) == nil then
                 return
@@ -502,6 +502,11 @@ function Babel:applyMetadata(books)
                 end
                 settings:saveSetting("custom_props", old)
                 settings:flush()
+                -- The cover browser keeps what it read of the book: make it read it again.
+                local ok, manager = pcall(require, "bookinfomanager")
+                if ok and manager then
+                    pcall(manager.deleteBookInfo, manager, path)
+                end
             end
         end)
     end
@@ -684,6 +689,30 @@ function Babel:readBook()
     return ok and book or nil
 end
 
+-- The first words of the page on screen (reflowable books only): another device finds the place
+-- again by this text, where the position of this renderer means nothing to it.
+local function cut(text, size)
+    text = text:gsub("%s+", " "):gsub("^ ", "")
+    if #text <= size then
+        return text
+    end
+    return (text:sub(1, size):gsub("[\192-\255][\128-\191]*$", ""))
+end
+
+function Babel:pageAnchor()
+    local ok, text = pcall(function()
+        local doc = self.ui and self.ui.document
+        if not doc or doc.info.has_pages then
+            return nil
+        end
+        local text = doc:getTextFromXPointers(doc:getXPointer(), doc:getPageXPointer(doc:getCurrentPage() + 1))
+        return type(text) == "table" and text.text or text
+    end)
+    if ok and type(text) == "string" and text ~= "" then
+        return cut(text, 100)
+    end
+end
+
 -- The reading progress of the books read lately (from KOReader's own records of each book):
 -- Babel shows it, and its reader opens the book there. Only what changed since the last send is
 -- sent, so an old position never overrides a newer one made elsewhere. Returns how many were sent.
@@ -724,6 +753,7 @@ function Babel:pushProgress()
                     percentage = found.percent,
                     device = deviceName(),
                     device_id = deviceName(),
+                    anchor = self.anchors and self.anchors[found.md5] or nil,
                 })
                 if code == 200 then
                     sent[found.md5] = found.percent
@@ -1031,6 +1061,12 @@ function Babel:onNetworkConnected()
 end
 
 function Babel:onCloseDocument()
+    local anchor = self:pageAnchor()
+    local md5 = self.ui.doc_settings and self.ui.doc_settings:readSetting("partial_md5_checksum")
+    if anchor and md5 then
+        self.anchors = self.anchors or {}
+        self.anchors[md5] = anchor
+    end
     UIManager:scheduleIn(10, function()
         if NetworkMgr:isConnected() then
             self:pushProgress()
@@ -1053,6 +1089,50 @@ function Babel:onCloseDocument()
         if NetworkMgr:isConnected() then
             self:upload(false)
         end
+    end)
+end
+
+-- A book opened after being read elsewhere (Babel's app, not another KOReader, which does it
+-- itself): offers to go where the reader stopped, found again by the words saved there.
+function Babel:onReaderReady()
+    pcall(function()
+        local doc = self.ui.document
+        local md5 = self.ui.doc_settings:readSetting("partial_md5_checksum")
+        if not md5 or doc.info.has_pages or not NetworkMgr:isConnected() then
+            return
+        end
+        local data = self:getJson("/syncs/progress/" .. md5)
+        if not data or not data.anchor or data.anchor == "" or (data.progress or "") ~= "" then
+            return
+        end
+        local seen = self.settings:readSetting("anchor_seen") or {}
+        if (seen[md5] or 0) >= (data.timestamp or 0) then
+            return
+        end
+        seen[md5] = data.timestamp
+        self.settings:saveSetting("anchor_seen", seen)
+        self.settings:flush()
+        local ConfirmBox = require("ui/widget/confirmbox")
+        UIManager:show(ConfirmBox:new{
+            text = T(_("Go to where you stopped on %1?"), data.device or "Babel"),
+            ok_callback = function()
+                local words = {}
+                for word in data.anchor:gmatch("%S+") do
+                    words[#words + 1] = word
+                    if #words == 8 then
+                        break
+                    end
+                end
+                for size = #words, 3, -1 do
+                    local found = doc:findAllText(table.concat(words, " ", 1, size), true, 0, 5, false)
+                    if found and found[1] and found[1].start then
+                        self.ui.rolling:onGotoXPointer(found[1].start)
+                        return
+                    end
+                end
+                UIManager:show(InfoMessage:new{ text = _("This place was not found in this copy."), timeout = 3 })
+            end,
+        })
     end)
 end
 
