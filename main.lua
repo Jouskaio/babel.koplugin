@@ -473,6 +473,24 @@ function Babel:cleanUp(books, verbose)
     end
 end
 
+-- The keywords of a book from its Babel tags, one per line (KOReader's own form), or nil
+-- when Babel has none. Commas, semicolons, pipes and a spaced slash split keywords
+-- in Bookshelf, so a tag loses them to stay one genre.
+local function keywordsOf(tags)
+    if type(tags) ~= "table" then
+        return nil
+    end
+    local lines = {}
+    for _i, tag in ipairs(tags) do
+        local clean = tostring(tag):gsub("%s*[,;|\n]%s*", " "):gsub("%s+/%s+", "/")
+        clean = clean:match("^%s*(.-)%s*$")
+        if clean ~= "" then
+            lines[#lines + 1] = clean
+        end
+    end
+    return #lines > 0 and table.concat(lines, "\n") or nil
+end
+
 -- Brings the books of the library missing from the e-reader, in the background.
 -- Gives each downloaded book the title, authors, series and volume Babel knows (KOReader's
 -- "custom metadata", next to the book: the file itself stays as it is, so its progress id holds).
@@ -501,10 +519,19 @@ function Babel:applyMetadata(books)
                 props.series = book.series
                 props.series_index = tonumber(book.series_index)
             end
+            local old = settings:readSetting("custom_props") or {}
+            -- Babel's tags become the book's keywords, which Bookshelf and the cover browser
+            -- show as genres: an AO3 file names some sixty tags, and each became a genre.
+            -- Keywords the reader changed on the e-reader stay theirs.
+            local keywords = keywordsOf(book.tags)
+            local ours = settings:readSetting("babel_keywords")
+            if keywords and (old.keywords == nil or old.keywords == ours) then
+                props.keywords = keywords
+                settings:saveSetting("babel_keywords", keywords)
+            end
             if next(props) == nil then
                 return
             end
-            local old = settings:readSetting("custom_props") or {}
             local same = true
             for k, v in pairs(props) do
                 same = same and old[k] == v
@@ -520,6 +547,10 @@ function Babel:applyMetadata(books)
                 if ok and manager then
                     pcall(manager.deleteBookInfo, manager, path)
                 end
+                -- And so do the plugins that list books (Bookshelf groups them by genre).
+                local Event = require("ui/event")
+                UIManager:broadcastEvent(Event:new("InvalidateMetadataCache", path))
+                UIManager:broadcastEvent(Event:new("BookMetadataChanged", { filepath = path }))
             end
         end)
     end
