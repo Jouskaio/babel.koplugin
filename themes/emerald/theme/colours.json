@@ -1,0 +1,26 @@
+{
+  "day": {
+    "text": "#F3E6C4",
+    "progress bar": "#D4AF64",
+    "progress track": "#1E3A2E",
+    "bookmark": "#D4AF64",
+    "panel": "#040C09",
+    "panel text": "#F3E6C4",
+    "selected shelf": "#D4AF64",
+    "selected shelf text": "#040C09",
+    "page": "#040C09",
+    "plank": "#1A1A1C"
+  },
+  "night": {
+    "text": "#F3E6C4",
+    "progress bar": "#D4AF64",
+    "progress track": "#1E3A2E",
+    "bookmark": "#D4AF64",
+    "panel": "#040C09",
+    "panel text": "#F3E6C4",
+    "selected shelf": "#D4AF64",
+    "selected shelf text": "#040C09",
+    "page": "#040C09",
+    "plank": "#1A1A1C"
+  }
+}

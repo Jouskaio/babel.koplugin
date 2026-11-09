@@ -73,4 +73,25 @@ when the e-reader goes online (at most once an hour); the other entries are unde
 - *Test the connection to Babel* tells you whether the e-reader reaches Babel and is logged in.
 - Each of these can be switched off in Tools › Babel.
 
+## Bookshelf themes
+
+For the [Bookshelf](https://github.com/AndyHazz/bookshelf.koplugin) plugin's home screen, Tools ›
+Babel › *Bookshelf themes* lists Babel's own themes: **Cabinet de lecture** (dark academia:
+walnut panelling and a banker's lamp), **Nébuleuse** (a nebula sky and crystals), **Crypte** (stone
+and candlelight), **Arabesque** (art nouveau, a Gallé vase and a Tiffany lamp) and **Émeraude** (art
+deco, green and gold). Each brings a wallpaper, a plank, colours and two ornaments.
+
+- Tick as many as you like: each is installed for Bookshelf at once (into
+  `koreader/settings/bookshelf/ornaments`), and kept up to date when the plugin is. Untick one to
+  remove it. Then choose a theme in Bookshelf's Theme library (a shelf can have its own).
+- *Add my own theme (folder or .zip)…* takes a theme pack you have on the e-reader, unpacks it
+  when it is a zip, and checks it first: a `theme` folder (`theme.json`, `colours.json`,
+  wallpaper, `plank.left/middle/right.png` of the same height) and SVG or PNG ornaments
+  beside it. What Bookshelf could not use is refused, and what it would ignore is pointed out.
+  *My added themes* removes one again.
+- The plugin only ever removes the themes it installed, never a pack you copied there yourself.
+
+The themes are drawn by `scripts/koreader-themes/` in Babel's repository
+(`node scripts/koreader-themes/build.mjs`, with Playwright).
+
 The data stays between your e-reader and your Babel server.

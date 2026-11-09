@@ -9,6 +9,9 @@ book, how long and how many pages you read each day. Babel adds them to your own
 It also brings your books to the e-reader: the ones marked "On my e-reader" in Babel (or the whole
 library) are downloaded into a "Babel" folder, one after the other, when the e-reader goes online.
 
+It also installs Bookshelf themes (Babel's, and the reader's own, from a folder or a .zip): see
+babel_bookshelf.lua.
+
 Menu: Tools > Babel.
 --]]
 
@@ -28,6 +31,12 @@ local socket = require("socket")
 local socketutil = require("socketutil")
 local _ = require("gettext")
 local T = require("ffi/util").template
+-- Required now: the plugin's folder is on the module path only while KOReader loads it.
+local ok_shelf, Shelf = pcall(require, "babel_bookshelf")
+if not ok_shelf then
+    logger.warn("Babel: Bookshelf themes unavailable", Shelf)
+    Shelf = nil
+end
 
 local DAY = 24 * 60 * 60
 
@@ -47,6 +56,10 @@ function Babel:init()
     self.jobs = {}
     self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
+    -- The chosen Bookshelf themes, brought up to this version of the plugin (a copy: no network).
+    UIManager:nextTick(function()
+        self:syncThemes(false)
+    end)
 end
 
 -- One-tap actions: they can be put in a gesture, a profile or the Bookshelf start menu
@@ -1046,6 +1059,10 @@ end
 
 -- Online again: sync with Babel, at most once an hour.
 function Babel:onNetworkConnected()
+    -- Chosen themes the plugin came without are downloaded now.
+    UIManager:scheduleIn(3, function()
+        self:syncThemes(true)
+    end)
     if self.settings:readSetting("auto_download") == false then
         return
     end
@@ -1226,6 +1243,12 @@ function Babel:addToMainMenu(menu_items)
                 end,
             },
             {
+                text = _("Bookshelf themes"),
+                sub_item_table_func = function()
+                    return self:themesMenu()
+                end,
+            },
+            {
                 text = _("Options"),
                 separator = true,
                 sub_item_table = {
@@ -1361,6 +1384,220 @@ function Babel:addToMainMenu(menu_items)
             },
         },
     }
+end
+
+-- ── Bookshelf themes ─────────────────────────────────────────────────────────
+
+function Babel:chosenThemes()
+    return self.settings:readSetting("bookshelf_themes") or {}
+end
+
+-- Installs the chosen themes that are missing or older than the plugin's ([download]: from
+-- GitHub when the plugin came without them, only when already online).
+function Babel:syncThemes(download)
+    if not Shelf then
+        return
+    end
+    pcall(function()
+        Shelf.sync(self.path, self:chosenThemes(), download and NetworkMgr:isConnected())
+    end)
+end
+
+local function themeDone(text)
+    require("ui/widget/notification"):notify(text)
+end
+
+function Babel:toggleTheme(theme)
+    local chosen = self:chosenThemes()
+    if chosen[theme.id] then
+        chosen[theme.id] = nil
+        self.settings:saveSetting("bookshelf_themes", chosen)
+        self.settings:flush()
+        Shelf.uninstall(theme)
+        themeDone(T(_("Bookshelf theme removed: %1"), theme.name))
+        return
+    end
+    chosen[theme.id] = true
+    self.settings:saveSetting("bookshelf_themes", chosen)
+    self.settings:flush()
+    local function report(ok, err)
+        if ok then
+            themeDone(T(_("Bookshelf theme installed: %1. Choose it in Bookshelf's Theme library."), theme.name))
+        elseif err == "foreign" then
+            UIManager:show(InfoMessage:new{
+                text = T(_("A theme folder named \"%1\" is already there and was not made by Babel: it was left as it is."), theme.folder),
+            })
+        else
+            UIManager:show(InfoMessage:new{ text = T(_("Could not install the theme %1."), theme.name) })
+        end
+    end
+    local ok, err = Shelf.install(self.path, theme, false)
+    if ok or err ~= "missing" then
+        return report(ok, err)
+    end
+    -- The plugin came without its themes (installed from Babel's site file by file): from GitHub.
+    NetworkMgr:runWhenOnline(function()
+        local info = InfoMessage:new{ text = T(_("Downloading the theme %1…"), theme.name) }
+        UIManager:show(info)
+        UIManager:forceRePaint()
+        local ok2, err2 = Shelf.install(self.path, theme, true)
+        UIManager:close(info)
+        report(ok2, err2)
+    end)
+end
+
+-- Asks for a folder or a .zip, checks it is a Bookshelf theme, says what it found, installs it.
+function Babel:importTheme()
+    local PathChooser = require("ui/widget/pathchooser")
+    local home = G_reader_settings:readSetting("home_dir") or "/sdcard"
+    UIManager:show(PathChooser:new{
+        title = _("Long-press a theme's folder or .zip"),
+        path = home,
+        select_directory = true,
+        select_file = true,
+        file_filter = function(file)
+            return file:lower():match("%.zip$") ~= nil
+        end,
+        onConfirm = function(path)
+            UIManager:nextTick(function()
+                self:checkTheme(path)
+            end)
+        end,
+    })
+end
+
+function Babel:checkTheme(path)
+    local info = InfoMessage:new{ text = _("Checking the theme…") }
+    UIManager:show(info)
+    UIManager:forceRePaint()
+    local ok, report, root = pcall(Shelf.prepare, path)
+    UIManager:close(info)
+    if not ok or not report then
+        Shelf.cleanUp()
+        UIManager:show(InfoMessage:new{ text = ok and root or T(_("Could not read this theme (%1)."), tostring(report)) })
+        return
+    end
+    local lines = {}
+    if not report.ok then
+        lines[#lines + 1] = T(_("%1 is not a theme Bookshelf can use:"), report.name)
+        for _i, line in ipairs(report.errors) do
+            lines[#lines + 1] = "• " .. line
+        end
+        for _i, line in ipairs(report.warnings) do
+            lines[#lines + 1] = "• " .. line
+        end
+        Shelf.cleanUp()
+        UIManager:show(InfoMessage:new{ text = table.concat(lines, "\n") })
+        return
+    end
+    local brings = {}
+    if report.wallpaper then brings[#brings + 1] = _("a wallpaper") end
+    if report.planks > 0 then brings[#brings + 1] = T(_("%1 plank(s)"), report.planks) end
+    if (report.colours or 0) > 0 then brings[#brings + 1] = _("colours") end
+    if report.ornaments > 0 then brings[#brings + 1] = T(_("%1 ornament(s)"), report.ornaments) end
+    lines[#lines + 1] = T(_("Theme \"%1\": %2."), report.name, table.concat(brings, ", "))
+    if #report.warnings > 0 then
+        lines[#lines + 1] = ""
+        lines[#lines + 1] = _("To know:")
+        for _i, line in ipairs(report.warnings) do
+            lines[#lines + 1] = "• " .. line
+        end
+    end
+    local ConfirmBox = require("ui/widget/confirmbox")
+    UIManager:show(ConfirmBox:new{
+        text = table.concat(lines, "\n"),
+        ok_text = _("Install"),
+        ok_callback = function()
+            local folder = Shelf.installChecked(root, report)
+            Shelf.cleanUp()
+            if folder then
+                themeDone(T(_("Bookshelf theme installed: %1. Choose it in Bookshelf's Theme library."), report.name))
+            else
+                UIManager:show(InfoMessage:new{ text = T(_("Could not install the theme %1."), report.name) })
+            end
+        end,
+        cancel_callback = function()
+            Shelf.cleanUp()
+        end,
+    })
+end
+
+function Babel:themesMenu()
+    if not Shelf then
+        return { { text = _("Bookshelf themes are not available in this copy of the plugin."), enabled = false } }
+    end
+    local items = {}
+    if not Shelf.bookshelfFound(self.path) then
+        items[#items + 1] = {
+            text = _("Needs the Bookshelf plugin (tap for more)"),
+            keep_menu_open = true,
+            callback = function()
+                UIManager:show(InfoMessage:new{
+                    text = _("These themes dress the Bookshelf plugin's home screen. Install Bookshelf (github.com/AndyHazz/bookshelf.koplugin, or KOReader's App Store), then choose a theme in Bookshelf's Theme library."),
+                })
+            end,
+            separator = true,
+        }
+    end
+    for i, theme in ipairs(Shelf.themes) do
+        items[#items + 1] = {
+            text = theme.name,
+            checked_func = function()
+                return self:chosenThemes()[theme.id] == true
+            end,
+            keep_menu_open = true,
+            callback = function()
+                self:toggleTheme(theme)
+            end,
+            hold_callback = function()
+                UIManager:show(InfoMessage:new{ text = theme.name .. "\n\n" .. theme.description })
+            end,
+            separator = i == #Shelf.themes,
+        }
+    end
+    items[#items + 1] = {
+        text = _("Add my own theme (folder or .zip)…"),
+        callback = function()
+            self:importTheme()
+        end,
+    }
+    items[#items + 1] = {
+        text = _("My added themes"),
+        sub_item_table_func = function()
+            local mine = {}
+            for _i, pack in ipairs(Shelf.imported()) do
+                mine[#mine + 1] = {
+                    text = pack.name,
+                    callback = function()
+                        local ConfirmBox = require("ui/widget/confirmbox")
+                        UIManager:show(ConfirmBox:new{
+                            text = T(_("Remove the theme %1 from Bookshelf?"), pack.name),
+                            ok_text = _("Remove"),
+                            ok_callback = function()
+                                Shelf.removeImported(pack.folder)
+                                themeDone(T(_("Bookshelf theme removed: %1"), pack.name))
+                            end,
+                        })
+                    end,
+                }
+            end
+            if #mine == 0 then
+                mine[1] = { text = _("None yet."), enabled = false }
+            end
+            return mine
+        end,
+        separator = true,
+    }
+    items[#items + 1] = {
+        text = _("About Bookshelf themes"),
+        keep_menu_open = true,
+        callback = function()
+            UIManager:show(InfoMessage:new{
+                text = T(_("Tick the themes you want: they are installed for Bookshelf at once, and kept up to date with the plugin. Untick one to remove it. Then choose one in Bookshelf's Theme library (a shelf can have its own).\n\nYour own theme: a folder or a .zip holding a theme folder (theme.json, colours.json, wallpaper, plank.left/middle/right.png) and SVG or PNG ornaments beside it. It is checked first, and what Bookshelf would not read is pointed out.\n\nThemes go to %1"), Shelf.root()),
+            })
+        end,
+    }
+    return items
 end
 
 return Babel
