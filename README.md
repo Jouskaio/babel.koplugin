@@ -79,7 +79,8 @@ For the [Bookshelf](https://github.com/AndyHazz/bookshelf.koplugin) plugin's hom
 Babel › *Bookshelf themes* lists Babel's own themes: **Cabinet de lecture** (dark academia:
 walnut panelling and a banker's lamp), **Nébuleuse** (a nebula sky and crystals), **Crypte** (stone
 and candlelight), **Arabesque** (art nouveau, a Gallé vase and a Tiffany lamp) and **Émeraude** (art
-deco, green and gold). Each brings a wallpaper, a plank, colours and two ornaments.
+deco, green and gold). Each brings a plank, two ornaments, and a light wallpaper and colours for
+day with dark ones for night: Bookshelf switches to them when you turn on KOReader's night mode.
 
 - Tick as many as you like: each is installed for Bookshelf at once (into
   `koreader/settings/bookshelf/ornaments`), and kept up to date when the plugin is. Untick one to

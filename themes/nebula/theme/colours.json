@@ -1,14 +1,14 @@
 {
   "day": {
-    "text": "#EEF2FF",
-    "progress bar": "#9FE3FF",
-    "progress track": "#2A3358",
-    "bookmark": "#9FE3FF",
-    "panel": "#080A1E",
-    "panel text": "#EEF2FF",
-    "selected shelf": "#9FE3FF",
-    "selected shelf text": "#080A1E",
-    "page": "#080A1E",
+    "text": "#33261A",
+    "progress bar": "#6A4FA0",
+    "progress track": "#DCCDAE",
+    "bookmark": "#6A4FA0",
+    "panel": "#F1E5C8",
+    "panel text": "#33261A",
+    "selected shelf": "#6A4FA0",
+    "selected shelf text": "#F1E5C8",
+    "page": "#F1E5C8",
     "plank": "#A8ADC2"
   },
   "night": {
