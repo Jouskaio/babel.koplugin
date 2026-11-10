@@ -73,6 +73,23 @@ when the e-reader goes online (at most once an hour); the other entries are unde
 - *Test the connection to Babel* tells you whether the e-reader reaches Babel and is logged in.
 - Each of these can be switched off in Tools › Babel.
 
+## BOOX sleep screens
+
+On a BOOX, the system draws the sleep and power-off screens, not KOReader: KOReader's screensaver
+settings, and Storefront's *Random from folder*, have no effect there. Tools › Babel › *BOOX sleep
+screens* (only on a BOOX) brings the random rotation back:
+
+- *Random sleep screen* and *Random power-off screen*: each time the e-reader wakes up with
+  KOReader open (and when KOReader starts), Babel draws an image at random from the folder and
+  hands it to BOOX for the next sleep, and another one for the next power-off. It never draws the
+  same image twice in a row.
+- *Folder*: by default KOReader's screensaver folder (`koreader/screensavers`, where Storefront
+  puts the wallpapers you install), with its subfolders. PNG, JPEG and BMP under 10 MB. Long-press
+  it to go back to the default folder.
+- *Change now* draws new images at once and says which.
+- It goes through BOOX's own `onyx.action.SCREENSAVER` broadcast (what *Set as screensaver* does).
+  The random sleep screen replaces BOOX's own list of sleep images.
+
 ## Bookshelf themes
 
 For the [Bookshelf](https://github.com/AndyHazz/bookshelf.koplugin) plugin's home screen, Tools ›

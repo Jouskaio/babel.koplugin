@@ -12,6 +12,9 @@ library) are downloaded into a "Babel" folder, one after the other, when the e-r
 It also installs Bookshelf themes (Babel's, and the reader's own, from a folder or a .zip): see
 babel_bookshelf.lua.
 
+On a BOOX, it can also change the system's sleep and power-off images at random from a folder
+(Storefront's screensaver collection by default): see babel_boox.lua.
+
 Menu: Tools > Babel.
 --]]
 
@@ -37,6 +40,14 @@ if not ok_shelf then
     logger.warn("Babel: Bookshelf themes unavailable", Shelf)
     Shelf = nil
 end
+local ok_boox, Boox = pcall(require, "babel_boox")
+if not ok_boox then
+    logger.warn("Babel: BOOX screens unavailable", Boox)
+    Boox = nil
+end
+-- Whether the BOOX screens were already changed since KOReader started (the plugin is loaded
+-- again with each book).
+local boox_started = false
 
 local DAY = 24 * 60 * 60
 
@@ -60,6 +71,12 @@ function Babel:init()
     UIManager:nextTick(function()
         self:syncThemes(false)
     end)
+    if not boox_started then
+        boox_started = true
+        UIManager:scheduleIn(2, function()
+            self:rotateBooxScreens(false)
+        end)
+    end
 end
 
 -- One-tap actions: they can be put in a gesture, a profile or the Bookshelf start menu
@@ -1280,6 +1297,15 @@ function Babel:addToMainMenu(menu_items)
                 end,
             },
             {
+                text = _("BOOX sleep screens"),
+                enabled_func = function()
+                    return self:isBoox()
+                end,
+                sub_item_table_func = function()
+                    return self:booxMenu()
+                end,
+            },
+            {
                 text = _("Options"),
                 separator = true,
                 sub_item_table = {
@@ -1413,6 +1439,177 @@ function Babel:addToMainMenu(menu_items)
                     },
                 },
             },
+        },
+    }
+end
+
+-- ── BOOX sleep screens ───────────────────────────────────────────────────────
+
+function Babel:isBoox()
+    if self._is_boox == nil then
+        self._is_boox = Boox ~= nil and Boox.isBoox()
+    end
+    return self._is_boox
+end
+
+function Babel:booxSettings()
+    return self.settings:readSetting("boox_screens") or {}
+end
+
+function Babel:saveBooxSettings(conf)
+    self.settings:saveSetting("boox_screens", conf)
+    self.settings:flush()
+end
+
+function Babel:booxFolder()
+    return self:booxSettings().folder or Boox.defaultFolder()
+end
+
+-- Draws new sleep and power-off images ([shown]: says what happened). Only on a BOOX, for the
+-- screens switched on, at most once every 30 s unless asked.
+function Babel:rotateBooxScreens(shown)
+    if not self:isBoox() then
+        return
+    end
+    local conf = self:booxSettings()
+    if not shown and not (conf.sleep or conf.power_off) then
+        return
+    end
+    local now = os.time()
+    if not shown and conf.rotated_at and now - conf.rotated_at < 30 then
+        return
+    end
+    local ok, set, count = pcall(Boox.rotate, {
+        folder = self:booxFolder(),
+        sleep = conf.sleep,
+        power_off = conf.power_off,
+        last = conf.last,
+    })
+    if not ok then
+        logger.warn("Babel: BOOX screens", set)
+        if shown then
+            UIManager:show(InfoMessage:new{ text = T(_("Could not change the BOOX screens (%1)."), tostring(set)) })
+        end
+        return
+    end
+    local last = conf.last or {}
+    conf.rotated_at = now
+    conf.last = { sleep = set.sleep or last.sleep, power_off = set.power_off or last.power_off }
+    self:saveBooxSettings(conf)
+    if not shown then
+        return
+    end
+    local lines = {}
+    if count == 0 then
+        lines[1] = T(_("No image BOOX can show (png, jpg or bmp, under 10 MB) in %1."), self:booxFolder())
+    elseif not (conf.sleep or conf.power_off) then
+        lines[1] = _("Switch on the sleep screen or the power-off screen first.")
+    else
+        local function name(path)
+            return path and path:match("([^/]+)$") or _("not changed")
+        end
+        if conf.sleep then
+            lines[#lines + 1] = T(_("Sleep: %1"), name(set.sleep))
+        end
+        if conf.power_off then
+            lines[#lines + 1] = T(_("Power-off: %1"), name(set.power_off))
+        end
+        lines[#lines + 1] = T(_("Drawn from %1 images."), count)
+    end
+    UIManager:show(InfoMessage:new{ text = table.concat(lines, "\n") })
+end
+
+-- Back from sleep (or from another app): new images for the next sleep and power-off.
+function Babel:onResume()
+    UIManager:scheduleIn(1, function()
+        self:rotateBooxScreens(false)
+    end)
+end
+
+function Babel:toggleBooxScreen(key)
+    local conf = self:booxSettings()
+    conf[key] = not conf[key]
+    conf.rotated_at = nil
+    self:saveBooxSettings(conf)
+    if conf[key] then
+        self:rotateBooxScreens(false)
+    end
+end
+
+function Babel:chooseBooxFolder()
+    local PathChooser = require("ui/widget/pathchooser")
+    UIManager:show(PathChooser:new{
+        title = _("Long-press the folder of your images"),
+        path = self:booxFolder(),
+        select_directory = true,
+        select_file = false,
+        onConfirm = function(path)
+            local conf = self:booxSettings()
+            conf.folder = path
+            conf.last = nil
+            self:saveBooxSettings(conf)
+            UIManager:nextTick(function()
+                self:rotateBooxScreens(true)
+            end)
+        end,
+    })
+end
+
+function Babel:booxMenu()
+    return {
+        {
+            text = _("Random sleep screen"),
+            checked_func = function()
+                return self:booxSettings().sleep == true
+            end,
+            keep_menu_open = true,
+            callback = function()
+                self:toggleBooxScreen("sleep")
+            end,
+        },
+        {
+            text = _("Random power-off screen"),
+            checked_func = function()
+                return self:booxSettings().power_off == true
+            end,
+            keep_menu_open = true,
+            callback = function()
+                self:toggleBooxScreen("power_off")
+            end,
+            separator = true,
+        },
+        {
+            text_func = function()
+                return T(_("Folder: %1"), self:booxFolder())
+            end,
+            keep_menu_open = true,
+            callback = function()
+                self:chooseBooxFolder()
+            end,
+            hold_callback = function()
+                local conf = self:booxSettings()
+                conf.folder = nil
+                conf.last = nil
+                self:saveBooxSettings(conf)
+                require("ui/widget/notification"):notify(T(_("Folder: %1"), self:booxFolder()))
+            end,
+        },
+        {
+            text = _("Change now"),
+            keep_menu_open = true,
+            callback = function()
+                self:rotateBooxScreens(true)
+            end,
+            separator = true,
+        },
+        {
+            text = _("About BOOX sleep screens"),
+            keep_menu_open = true,
+            callback = function()
+                UIManager:show(InfoMessage:new{
+                    text = _("On a BOOX, the system draws the sleep and power-off screens, not KOReader: KOReader's screensaver settings (and Storefront's \"Random from folder\") have no effect there.\n\nWith these switched on, each time the e-reader wakes up with KOReader open, Babel draws an image at random from the folder (Storefront's collection by default, with its subfolders) and gives it to BOOX for the next sleep, and another one for the next power-off. What you add to the folder joins the rotation.\n\nThe random sleep screen replaces BOOX's own list of sleep images. Long-press the folder to go back to the default one."),
+                })
+            end,
         },
     }
 end
