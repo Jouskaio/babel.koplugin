@@ -57,6 +57,46 @@ local function deviceName()
     return ok and device.model or "e-reader"
 end
 
+-- KOReader's identifier of a book file (the md5 of parts of it), worked out from the file itself.
+-- KOReader keeps the one it found first in the book's settings, even once the file is replaced
+-- by a new version (a fanfic with new chapters, downloaded over the old one): Babel no longer
+-- knows the book by that old one, and dropped what was sent with it.
+local function bookId(path, saved)
+    local ok, md5 = pcall(function()
+        return path and lfs.attributes(path, "mode") == "file" and require("util").partialMD5(path) or nil
+    end)
+    return ok and md5 or saved
+end
+
+-- The highlights (with their notes) of KOReader's list of annotations: a bookmark has no text.
+local function notesOf(list, pages)
+    local notes = {}
+    for _i, a in ipairs(type(list) == "table" and list or {}) do
+        if type(a) == "table" and type(a.text) == "string" and a.text ~= "" then
+            local page = tonumber(a.pageno)
+            notes[#notes + 1] = {
+                text = a.text,
+                note = a.note,
+                datetime = a.datetime,
+                percent = (page and pages and pages > 0) and math.min(100, page / pages * 100) or nil,
+            }
+        end
+    end
+    return notes
+end
+
+-- What a book's highlights are now, to send them again only when they changed.
+local function notesMark(notes)
+    local size, latest = 0, ""
+    for _i, n in ipairs(notes) do
+        size = size + #n.text + #(n.note or "")
+        if (n.datetime or "") > latest then
+            latest = n.datetime
+        end
+    end
+    return #notes .. "/" .. size .. "/" .. latest
+end
+
 local Babel = WidgetContainer:extend{
     name = "babel",
     is_doc_only = false,
@@ -727,24 +767,13 @@ function Babel:readBook()
         if not document then
             return nil
         end
-        local md5 = document.fastDigest and document:fastDigest()
+        local md5 = bookId(document.file, document.fastDigest and document:fastDigest())
         if not md5 then
             return nil
         end
         local summary = self.ui.doc_settings and self.ui.doc_settings:readSetting("summary") or {}
         local pages = document.getPageCount and document:getPageCount() or 0
-        local notes = {}
-        local list = self.ui.annotation and self.ui.annotation.annotations or {}
-        for _i, a in ipairs(list) do
-            if a.text and a.text ~= "" then
-                notes[#notes + 1] = {
-                    text = a.text,
-                    note = a.note,
-                    datetime = a.datetime,
-                    percent = (pages > 0 and tonumber(a.pageno)) and (a.pageno / pages * 100) or nil,
-                }
-            end
-        end
+        local notes = notesOf(self.ui.annotation and self.ui.annotation.annotations, pages)
         return { md5 = md5, finished = summary.status == "complete", notes = notes }
     end)
     return ok and book or nil
@@ -785,7 +814,6 @@ function Babel:pushProgress()
     if not ok or not history or not history.hist then
         return 0
     end
-    local util = require("util")
     local DocSettings = require("docsettings")
     local sent = self.settings:readSetting("progress_sent") or {}
     local count, looked = 0, 0
@@ -803,7 +831,7 @@ function Babel:pushProgress()
                 if not percent or percent <= 0 then
                     return nil
                 end
-                local md5 = doc:readSetting("partial_md5_checksum") or util.partialMD5(path)
+                local md5 = bookId(path, doc:readSetting("partial_md5_checksum"))
                 local position = doc:readSetting("last_xpointer") or tostring(doc:readSetting("last_page") or "")
                 return { md5 = md5, percent = percent, position = position }
             end)
@@ -828,15 +856,79 @@ function Babel:pushProgress()
     return count
 end
 
--- Sends a closed book's finished state and highlights (the ones already sent are ignored by Babel).
+-- Sends a book's highlights when they changed since they were last sent (Babel ignores the
+-- ones it already has). Kept to send again when Babel did not take them (offline, or a book
+-- it does not know yet). True when they were sent.
+function Babel:sendNotes(md5, notes)
+    if #notes == 0 or self.settings:readSetting("sync_notes") == false then
+        return false
+    end
+    local sent = self.settings:readSetting("notes_sent") or {}
+    local mark = notesMark(notes)
+    if sent[md5] == mark then
+        return false
+    end
+    local code = self:putJson("/syncs/annotations", { document = md5, device = deviceName(), annotations = notes })
+    if code ~= 200 then
+        logger.info("Babel: highlights not taken", md5, code)
+        return false
+    end
+    sent[md5] = mark
+    self.settings:saveSetting("notes_sent", sent)
+    self.settings:flush()
+    return true
+end
+
+-- The highlights of the books read lately, from KOReader's records of each book (and the open
+-- book as it is now): the ones never sent (made offline, or in a book left open) reach Babel
+-- at the next sync. Returns how many books had new highlights.
+function Babel:pushNotes()
+    if self.settings:readSetting("sync_notes") == false then
+        return 0
+    end
+    local ok, history = pcall(require, "readhistory")
+    if not ok or not history or not history.hist then
+        return 0
+    end
+    local DocSettings = require("docsettings")
+    local open = self.ui and self.ui.document and self.ui.document.file
+    local count, looked = 0, 0
+    local recent = os.time() - 60 * DAY
+    for _i, entry in ipairs(history.hist) do
+        looked = looked + 1
+        if looked > 60 then
+            break
+        end
+        local path = entry.file
+        if path and (entry.time or 0) >= recent and lfs.attributes(path, "mode") == "file" then
+            local book
+            if path == open then
+                book = self:readBook()
+            else
+                local done, found = pcall(function()
+                    local doc = DocSettings:open(path)
+                    local notes = notesOf(doc:readSetting("annotations"), doc:readSetting("doc_pages"))
+                    if #notes == 0 then
+                        return nil
+                    end
+                    return { md5 = bookId(path, doc:readSetting("partial_md5_checksum")), notes = notes }
+                end)
+                book = done and found or nil
+            end
+            if book and book.md5 and self:sendNotes(book.md5, book.notes) then
+                count = count + 1
+            end
+        end
+    end
+    return count
+end
+
+-- Sends a closed book's finished state and highlights.
 function Babel:syncBook(book)
-    local device = require("device").model or "e-reader"
     if book.finished and self.settings:readSetting("sync_finished") ~= false then
-        self:putJson("/syncs/finished", { document = book.md5, device = device })
+        self:putJson("/syncs/finished", { document = book.md5, device = deviceName() })
     end
-    if #book.notes > 0 and self.settings:readSetting("sync_notes") ~= false then
-        self:putJson("/syncs/annotations", { document = book.md5, device = device, annotations = book.notes })
-    end
+    self:sendNotes(book.md5, book.notes)
 end
 
 -- Books on the e-reader (in KOReader's home folder, except the Babel folder) that Babel lacks.
@@ -1085,6 +1177,10 @@ function Babel:syncAll(verbose)
     if progressed > 0 then
         report[#report + 1] = T(_("Reading progress sent: %1 books."), progressed)
     end
+    local noted = self:pushNotes()
+    if noted > 0 then
+        report[#report + 1] = T(_("Highlights sent: %1 books."), noted)
+    end
     self:sendBooks(false, function(sent, sendFailed)
         if sent > 0 or sendFailed > 0 then
             report[#report + 1] = T(_("Books sent to Babel: %1 (%2 failed)."), sent, sendFailed)
@@ -1127,7 +1223,7 @@ end
 
 function Babel:onCloseDocument()
     local anchor = self:pageAnchor()
-    local md5 = self.ui.doc_settings and self.ui.doc_settings:readSetting("partial_md5_checksum")
+    local md5 = self.ui.document and bookId(self.ui.document.file, self.ui.doc_settings and self.ui.doc_settings:readSetting("partial_md5_checksum"))
     if anchor and md5 then
         self.anchors = self.anchors or {}
         self.anchors[md5] = anchor
@@ -1162,7 +1258,7 @@ end
 function Babel:onReaderReady()
     pcall(function()
         local doc = self.ui.document
-        local md5 = self.ui.doc_settings:readSetting("partial_md5_checksum")
+        local md5 = bookId(doc.file, self.ui.doc_settings:readSetting("partial_md5_checksum"))
         if not md5 or doc.info.has_pages or not NetworkMgr:isConnected() then
             return
         end

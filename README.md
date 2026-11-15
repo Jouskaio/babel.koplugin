@@ -66,7 +66,9 @@ when the e-reader goes online (at most once an hour); the other entries are unde
 
 - When you close a book you marked as finished, Babel marks it finished too (and it leaves the
   list of books to download).
-- Your highlights and notes are sent to Babel as annotations (each is sent once).
+- Your highlights and notes are sent to Babel as annotations (each is sent once), when you
+  close the book and at each sync. Highlights made offline, or in a book left open, are sent at
+  the next sync; the ones Babel could not take (a book it does not know yet) are sent again.
 - *Remove finished books from the Babel folder* (off by default) deletes, from the Babel folder,
   the books this plugin downloaded that are no longer on the e-reader list. It never deletes a
   file it did not download.
